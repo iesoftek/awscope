@@ -14,6 +14,12 @@ type LastUsedProfile struct {
 	LastUsedAt  time.Time
 }
 
+type ProfileMapping struct {
+	ProfileName string
+	AccountID   string
+	LastUsedAt  time.Time
+}
+
 func (s *Store) UpsertAccountSeen(ctx context.Context, accountID, partition string, seenAt time.Time) error {
 	if seenAt.IsZero() {
 		seenAt = time.Now().UTC()
@@ -122,4 +128,39 @@ func (s *Store) LookupProfile(ctx context.Context, profileName string) (LastUsed
 		return LastUsedProfile{}, false, err
 	}
 	return m, true, nil
+}
+
+func (s *Store) ListProfiles(ctx context.Context) ([]ProfileMapping, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT profile_name, account_id, last_used_at
+FROM profiles
+ORDER BY profile_name ASC
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ProfileMapping
+	for rows.Next() {
+		var (
+			name      string
+			accountID sql.NullString
+			lastUsed  sql.NullString
+		)
+		if err := rows.Scan(&name, &accountID, &lastUsed); err != nil {
+			return nil, err
+		}
+		var t time.Time
+		if lastUsed.Valid {
+			if tt, err := time.Parse(time.RFC3339Nano, lastUsed.String); err == nil {
+				t = tt
+			}
+		}
+		out = append(out, ProfileMapping{ProfileName: name, AccountID: accountID.String, LastUsedAt: t})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }

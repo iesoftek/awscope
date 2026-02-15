@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strings"
+	"time"
 
 	actionsRegistry "awscope/internal/actions/registry"
 	"awscope/internal/aws"
@@ -261,17 +263,15 @@ func parseCSV(s string) []string {
 
 func newExportCmd(dbPath *string) *cobra.Command {
 	var (
-		format string
-		out    string
+		format  string
+		out     string
+		profile string
 	)
 	cmd := &cobra.Command{
 		Use:   "export",
 		Short: "Export inventory from SQLite",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			runCtx := cmd.Context()
-			if out == "" {
-				return fmt.Errorf("--out is required")
-			}
 
 			st, err := store.Open(store.OpenOptions{Path: *dbPath})
 			if err != nil {
@@ -279,25 +279,123 @@ func newExportCmd(dbPath *string) *cobra.Command {
 			}
 			defer st.Close()
 
+			profile = strings.TrimSpace(profile)
+			format = strings.TrimSpace(strings.ToLower(format))
+			if format == "" {
+				format = "json"
+			}
+
+			// Resolve output file name if not provided.
+			if out == "" {
+				label := "all"
+				if profile != "" {
+					label = profile
+				}
+				label = sanitizeFilename(label)
+				ts := time.Now().Format("20060102-150405")
+				ext := format
+				out = fmt.Sprintf("awscope-export-%s-%s.%s", label, ts, ext)
+			}
+
+			accountID := ""
+			if profile != "" {
+				meta, ok, err := st.LookupProfile(runCtx, profile)
+				if err != nil {
+					return err
+				}
+				if !ok || strings.TrimSpace(meta.AccountID) == "" {
+					return fmt.Errorf("unknown profile %q in DB (run `awscope scan --profile %s ...` first)", profile, profile)
+				}
+				accountID = meta.AccountID
+			}
+
+			doLogSuccess := func() {
+				dst := out
+				if abs, err := filepath.Abs(out); err == nil {
+					dst = abs
+				}
+				scope := "all"
+				if profile != "" {
+					scope = profile
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "export complete: format=%s scope=%s file=%s\n", format, scope, dst)
+			}
+
 			switch format {
 			case "json":
-				return exportJSON(runCtx, st, out)
+				if err := exportJSON(runCtx, st, out, accountID); err != nil {
+					return err
+				}
+				doLogSuccess()
+				return nil
+			case "csv":
+				if err := exportCSV(runCtx, st, out, profile, accountID); err != nil {
+					return err
+				}
+				doLogSuccess()
+				return nil
 			default:
-				return fmt.Errorf("unsupported --format %q (supported: json)", format)
+				return fmt.Errorf("unsupported --format %q (supported: json,csv)", format)
 			}
 		},
 	}
-	cmd.Flags().StringVar(&format, "format", "json", "Export format (json)")
-	cmd.Flags().StringVar(&out, "out", "", "Output file path (required)")
+	cmd.Flags().StringVar(&format, "format", "json", "Export format (json,csv)")
+	cmd.Flags().StringVar(&out, "out", "", "Output file path (optional; default: ./awscope-export-<profile|all>-<timestamp>.<ext>)")
+	cmd.Flags().StringVar(&profile, "profile", "", "AWS profile name (optional; when set, export only resources for that profile/account)")
 	return cmd
 }
 
-func exportJSON(ctx context.Context, st *store.Store, outPath string) error {
-	snap, err := st.ExportLatest(ctx)
+func exportJSON(ctx context.Context, st *store.Store, outPath string, accountID string) error {
+	var (
+		snap store.ExportSnapshot
+		err  error
+	)
+	if strings.TrimSpace(accountID) != "" {
+		snap, err = st.ExportLatestByAccount(ctx, accountID)
+	} else {
+		snap, err = st.ExportLatest(ctx)
+	}
 	if err != nil {
 		return err
 	}
 	return store.WriteJSONFile(outPath, snap)
+}
+
+func exportCSV(ctx context.Context, st *store.Store, outPath string, profile string, accountID string) error {
+	includeProfileCol := strings.TrimSpace(profile) == ""
+
+	f, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	return st.ExportResourcesCSV(ctx, f, store.ExportResourcesCSVOptions{
+		AccountID:            accountID,
+		IncludeProfileColumn: includeProfileCol,
+	})
+}
+
+func sanitizeFilename(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "all"
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_' || r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return strings.Trim(b.String(), "._-")
 }
 
 func newCacheCmd() *cobra.Command {

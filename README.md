@@ -99,6 +99,31 @@ Notes:
 - Many services are usage-based; those will show unknown or partial estimates.
 - CloudWatch Logs estimate is storage-only (from `storedBytes`), excluding ingestion/insights/vended logs/etc.
 
+## Export
+
+Export the latest inventory snapshot from SQLite:
+
+```sh
+go run ./cmd/awscope export --format json --out awscope-export.json
+```
+
+Export resources as CSV:
+
+```sh
+go run ./cmd/awscope export --format csv
+```
+
+Profile-scoped export (filters by the profile's account in the DB):
+
+```sh
+go run ./cmd/awscope export --format csv --profile default --out default.csv
+```
+
+Notes:
+
+- If `--out` is omitted, the file is written to the current directory as `awscope-export-<profile|all>-<timestamp>.<ext>`.
+- CSV includes `tags_json`, `attributes_json`, and `raw_json` columns for detailed inspection.
+
 ## DB / Offline
 
 The TUI can browse cached data with:
@@ -114,4 +139,3 @@ Run tests:
 ```sh
 go test ./...
 ```
-

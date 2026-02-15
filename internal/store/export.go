@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -45,6 +46,26 @@ func (s *Store) ExportLatest(ctx context.Context) (ExportSnapshot, error) {
 		return ExportSnapshot{}, err
 	}
 	edges, err := s.exportEdges(ctx)
+	if err != nil {
+		return ExportSnapshot{}, err
+	}
+	return ExportSnapshot{
+		ExportedAt: time.Now().UTC(),
+		Resources:  resources,
+		Edges:      edges,
+	}, nil
+}
+
+func (s *Store) ExportLatestByAccount(ctx context.Context, accountID string) (ExportSnapshot, error) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return ExportSnapshot{}, nil
+	}
+	resources, err := s.exportResourcesByAccount(ctx, accountID)
+	if err != nil {
+		return ExportSnapshot{}, err
+	}
+	edges, err := s.exportEdgesByAccount(ctx, accountID)
 	if err != nil {
 		return ExportSnapshot{}, err
 	}
@@ -124,12 +145,118 @@ ORDER BY resource_key
 	return out, nil
 }
 
+func (s *Store) exportResourcesByAccount(ctx context.Context, accountID string) ([]ExportResource, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT
+  resource_key, account_id, partition, region, service, type,
+  arn, primary_id, display_name,
+  tags_json, attributes_json, raw_json,
+  collected_at, updated_at
+FROM resources
+WHERE account_id = ?
+ORDER BY resource_key
+`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ExportResource
+	for rows.Next() {
+		var (
+			keyStr      string
+			accountID   string
+			partition   string
+			region      string
+			service     string
+			typ         string
+			arn         sql.NullString
+			primaryID   string
+			displayName string
+			tagsJSON    string
+			attrsJSON   string
+			rawJSON     string
+			collectedAt string
+			updatedAt   string
+		)
+		if err := rows.Scan(
+			&keyStr, &accountID, &partition, &region, &service, &typ,
+			&arn, &primaryID, &displayName,
+			&tagsJSON, &attrsJSON, &rawJSON,
+			&collectedAt, &updatedAt,
+		); err != nil {
+			return nil, err
+		}
+		var tags map[string]string
+		_ = json.Unmarshal([]byte(tagsJSON), &tags)
+		var attrs map[string]any
+		_ = json.Unmarshal([]byte(attrsJSON), &attrs)
+
+		out = append(out, ExportResource{
+			ResourceKey:    keyStr,
+			AccountID:      accountID,
+			Partition:      partition,
+			Region:         region,
+			Service:        service,
+			Type:           typ,
+			Arn:            arn.String,
+			PrimaryID:      primaryID,
+			DisplayName:    displayName,
+			Tags:           tags,
+			Attributes:     attrs,
+			Raw:            json.RawMessage(rawJSON),
+			CollectedAtRFC: collectedAt,
+			UpdatedAtRFC:   updatedAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (s *Store) exportEdges(ctx context.Context) ([]ExportEdge, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT from_key, to_key, kind, meta_json, collected_at
 FROM edges
 ORDER BY from_key, kind, to_key
 `)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ExportEdge
+	for rows.Next() {
+		var fromKey, toKey, kind, metaJSON, collectedAt string
+		if err := rows.Scan(&fromKey, &toKey, &kind, &metaJSON, &collectedAt); err != nil {
+			return nil, err
+		}
+		meta := map[string]any{}
+		_ = json.Unmarshal([]byte(metaJSON), &meta)
+		out = append(out, ExportEdge{
+			FromKey:        fromKey,
+			ToKey:          toKey,
+			Kind:           kind,
+			Meta:           meta,
+			CollectedAtRFC: collectedAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) exportEdgesByAccount(ctx context.Context, accountID string) ([]ExportEdge, error) {
+	// Resource keys embed account id in the key string. Filter edges by prefix match.
+	like := "%|" + accountID + "|%"
+	rows, err := s.db.QueryContext(ctx, `
+SELECT from_key, to_key, kind, meta_json, collected_at
+FROM edges
+WHERE from_key LIKE ? OR to_key LIKE ?
+ORDER BY from_key, kind, to_key
+`, like, like)
 	if err != nil {
 		return nil, err
 	}
