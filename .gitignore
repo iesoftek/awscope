@@ -1,0 +1,9 @@
+*.sqlite
+*.sqlite3
+*.db
+
+dist/
+bin/
+
+.DS_Store
+
