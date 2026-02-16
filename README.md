@@ -53,6 +53,16 @@ Supported services (as of this repo state):
 
 Scan is best-effort: if some APIs are `AccessDenied`, scan continues for other services and prints an error summary.
 
+IAM (for users/groups/access keys) uses these APIs:
+
+- `iam:ListUsers`
+- `iam:ListAccessKeys`
+- `iam:GetAccessKeyLastUsed`
+- `iam:ListGroups`
+- `iam:ListGroupsForUser`
+- `iam:GenerateCredentialReport`
+- `iam:GetCredentialReport`
+
 ## TUI
 
 Start:

@@ -66,10 +66,10 @@ func Pad(s string, w int) string {
 
 type noneSet struct{}
 
-func (noneSet) Service(string) string                     { return "" }
-func (noneSet) Type(string) string                        { return "" }
-func (noneSet) Status(string) string                      { return "" }
-func (noneSet) Relationship(kind, dir string) string       { return "" }
+func (noneSet) Service(string) string                { return "" }
+func (noneSet) Type(string) string                   { return "" }
+func (noneSet) Status(string) string                 { return "" }
+func (noneSet) Relationship(kind, dir string) string { return "" }
 
 type asciiSet struct{}
 
@@ -109,6 +109,12 @@ func (asciiSet) Service(service string) string {
 func (asciiSet) Type(typ string) string {
 	t := strings.ToLower(strings.TrimSpace(typ))
 	switch t {
+	case "iam:user":
+		return "u"
+	case "iam:group":
+		return "G"
+	case "iam:access-key":
+		return "k"
 	case "ec2:instance":
 		return "i"
 	case "ec2:security-group":
@@ -204,11 +210,21 @@ func (nerdSet) Service(service string) string {
 }
 
 func (n nerdSet) Type(typ string) string {
-	parts := strings.SplitN(strings.TrimSpace(typ), ":", 2)
-	if len(parts) > 0 {
-		return n.Service(parts[0])
+	t := strings.ToLower(strings.TrimSpace(typ))
+	switch t {
+	case "iam:user":
+		return "󰌾"
+	case "iam:group":
+		return "󰉖"
+	case "iam:access-key":
+		return "󰌋"
+	default:
+		parts := strings.SplitN(strings.TrimSpace(typ), ":", 2)
+		if len(parts) > 0 {
+			return n.Service(parts[0])
+		}
+		return ""
 	}
-	return ""
 }
 
 func (nerdSet) Status(status string) string {

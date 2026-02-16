@@ -156,6 +156,9 @@ AND (
 	if strings.EqualFold(strings.TrimSpace(service), "logs") && strings.EqualFold(strings.TrimSpace(typ), "logs:log-group") {
 		// Prefer largest stored log groups first.
 		order = "ORDER BY CAST(json_extract(r.attributes_json, '$.storedBytes') AS INTEGER) DESC, r.display_name ASC"
+	} else if strings.EqualFold(strings.TrimSpace(service), "iam") && strings.EqualFold(strings.TrimSpace(typ), "iam:access-key") {
+		// Prefer oldest keys first.
+		order = "ORDER BY CAST(json_extract(r.attributes_json, '$.age_days') AS INTEGER) DESC, r.display_name ASC"
 	}
 
 	q := fmt.Sprintf(`

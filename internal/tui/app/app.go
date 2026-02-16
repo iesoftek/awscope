@@ -380,12 +380,13 @@ func (m *model) applyTheme() {
 	m.regionTable.SetStyles(tbl)
 	// Re-render row content that embeds style (e.g. dim "-").
 	includeStored := strings.EqualFold(m.selectedService, "logs") && strings.EqualFold(m.selectedType, "logs:log-group")
+	includeIAMKeyFields := strings.EqualFold(m.selectedService, "iam") && strings.EqualFold(m.selectedType, "iam:access-key")
 	w := 80
 	if m.paneMidW > 0 {
 		w = m.paneMidW - 4
 	}
-	m.resources.SetColumns(buildResourceColumns(w, m.pricingMode, includeStored))
-	m.resources.SetRows(makeResourceRows(m.resourceSummaries, m.pricingMode, m.styles, m.icons, includeStored))
+	m.resources.SetColumns(buildResourceColumns(w, m.pricingMode, includeStored, includeIAMKeyFields))
+	m.resources.SetRows(makeResourceRows(m.resourceSummaries, m.pricingMode, m.styles, m.icons, includeStored, includeIAMKeyFields))
 
 	// Navigator.
 	m.nav.SetStyles(navigator.Styles{
@@ -462,15 +463,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					w = m.paneMidW - 4
 				}
 				includeStored := strings.EqualFold(m.selectedService, "logs") && strings.EqualFold(m.selectedType, "logs:log-group")
+				includeIAMKeyFields := strings.EqualFold(m.selectedService, "iam") && strings.EqualFold(m.selectedType, "iam:access-key")
 				// Avoid transient row/column mismatches that can panic in table rendering.
 				if newMode {
 					// Adding a column: columns first, then rows.
-					m.resources.SetColumns(buildResourceColumns(w, true, includeStored))
-					m.resources.SetRows(makeResourceRows(m.resourceSummaries, true, m.styles, m.icons, includeStored))
+					m.resources.SetColumns(buildResourceColumns(w, true, includeStored, includeIAMKeyFields))
+					m.resources.SetRows(makeResourceRows(m.resourceSummaries, true, m.styles, m.icons, includeStored, includeIAMKeyFields))
 				} else {
 					// Removing a column: rows first, then columns.
-					m.resources.SetRows(makeResourceRows(m.resourceSummaries, false, m.styles, m.icons, includeStored))
-					m.resources.SetColumns(buildResourceColumns(w, false, includeStored))
+					m.resources.SetRows(makeResourceRows(m.resourceSummaries, false, m.styles, m.icons, includeStored, includeIAMKeyFields))
+					m.resources.SetColumns(buildResourceColumns(w, false, includeStored, includeIAMKeyFields))
 				}
 
 				// Load cost aggregates when enabled.
@@ -977,12 +979,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.resourceSummaries = msg.summaries
 			includeStored := strings.EqualFold(m.selectedService, "logs") && strings.EqualFold(m.selectedType, "logs:log-group")
+			includeIAMKeyFields := strings.EqualFold(m.selectedService, "iam") && strings.EqualFold(m.selectedType, "iam:access-key")
 			w := 80
 			if m.paneMidW > 0 {
 				w = m.paneMidW - 4
 			}
-			m.resources.SetColumns(buildResourceColumns(w, m.pricingMode, includeStored))
-			m.resources.SetRows(makeResourceRows(msg.summaries, m.pricingMode, m.styles, m.icons, includeStored))
+			m.resources.SetColumns(buildResourceColumns(w, m.pricingMode, includeStored, includeIAMKeyFields))
+			m.resources.SetRows(makeResourceRows(msg.summaries, m.pricingMode, m.styles, m.icons, includeStored, includeIAMKeyFields))
 			if m.pendingSelectKey != "" {
 				for idx := range msg.summaries {
 					if msg.summaries[idx].Key == m.pendingSelectKey {
@@ -1049,7 +1052,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusbar, _ = m.statusbar.Update(msg)
 
 		includeStored := strings.EqualFold(m.selectedService, "logs") && strings.EqualFold(m.selectedType, "logs:log-group")
-		m.resources.SetColumns(buildResourceColumns(mid-4, m.pricingMode, includeStored))
+		includeIAMKeyFields := strings.EqualFold(m.selectedService, "iam") && strings.EqualFold(m.selectedType, "iam:access-key")
+		m.resources.SetColumns(buildResourceColumns(mid-4, m.pricingMode, includeStored, includeIAMKeyFields))
 		m.regionTable.SetWidth(mid - 4)
 		m.regionTable.SetHeight(max(6, h-12))
 		m.regionTable.SetColumns(buildRegionColumns(mid - 4))
@@ -2877,7 +2881,7 @@ func (m model) selectedRegionSlice() []string {
 	return out
 }
 
-func buildResourceColumns(width int, includeCost bool, includeStored bool) []table.Column {
+func buildResourceColumns(width int, includeCost bool, includeStored bool, includeIAMKeyFields bool) []table.Column {
 	// Reserve widths for non-name fields; name gets the remainder.
 	if width <= 0 {
 		width = 80
@@ -2886,6 +2890,8 @@ func buildResourceColumns(width int, includeCost bool, includeStored bool) []tab
 	typeW := 18
 	statusW := 12 // includes optional status icon prefix
 	storedW := 10
+	ageW := 6
+	lastUsedW := 16
 	idW := 22
 	createdW := 19
 	costW := 10
@@ -2893,6 +2899,9 @@ func buildResourceColumns(width int, includeCost bool, includeStored bool) []tab
 	fixed := regionW + typeW + statusW + idW + createdW + sep
 	if includeStored {
 		fixed += storedW
+	}
+	if includeIAMKeyFields {
+		fixed += ageW + lastUsedW
 	}
 	if includeCost {
 		fixed += costW
@@ -2907,6 +2916,12 @@ func buildResourceColumns(width int, includeCost bool, includeStored bool) []tab
 		{Title: "Region", Width: regionW},
 		{Title: "Status", Width: statusW},
 	}
+	if includeIAMKeyFields {
+		cols = append(cols,
+			table.Column{Title: "Age", Width: ageW},
+			table.Column{Title: "Last Used", Width: lastUsedW},
+		)
+	}
 	if includeStored {
 		cols = append(cols, table.Column{Title: "Stored", Width: storedW})
 	}
@@ -2920,7 +2935,7 @@ func buildResourceColumns(width int, includeCost bool, includeStored bool) []tab
 	return cols
 }
 
-func makeResourceRows(ss []store.ResourceSummary, includeCost bool, styles theme.Styles, ic icons.Set, includeStored bool) []table.Row {
+func makeResourceRows(ss []store.ResourceSummary, includeCost bool, styles theme.Styles, ic icons.Set, includeStored bool, includeIAMKeyFields bool) []table.Row {
 	rows := make([]table.Row, 0, len(ss))
 	for _, s := range ss {
 		name := strings.TrimSpace(s.DisplayName)
@@ -2935,6 +2950,12 @@ func makeResourceRows(ss []store.ResourceSummary, includeCost bool, styles theme
 
 		statusRaw := statusFromAttrs(s.Attributes)
 		status := renderStatusForTable(statusRaw, styles, ic)
+		age := ""
+		lastUsed := ""
+		if includeIAMKeyFields {
+			age = renderAgeDaysForTable(s.Attributes, styles)
+			lastUsed = renderLastUsedForTable(s.Attributes, styles)
+		}
 		stored := ""
 		if includeStored {
 			stored = renderStoredGiBForTable(s.Attributes, styles)
@@ -2964,6 +2985,9 @@ func makeResourceRows(ss []store.ResourceSummary, includeCost bool, styles theme
 			styles.Dim.Render(s.Region),
 			status,
 		}
+		if includeIAMKeyFields {
+			base = append(base, age, lastUsed)
+		}
 		if includeStored {
 			base = append(base, stored)
 		}
@@ -2977,6 +3001,47 @@ func makeResourceRows(ss []store.ResourceSummary, includeCost bool, styles theme
 		rows = append(rows, base)
 	}
 	return rows
+}
+
+func renderAgeDaysForTable(attrs map[string]any, styles theme.Styles) string {
+	if attrs == nil {
+		return styles.Dim.Render("-")
+	}
+	var n int64 = -1
+	switch v := attrs["age_days"].(type) {
+	case int:
+		n = int64(v)
+	case int64:
+		n = v
+	case float64:
+		n = int64(v)
+	case json.Number:
+		if i, err := v.Int64(); err == nil {
+			n = i
+		}
+	case string:
+		if i, err := json.Number(strings.TrimSpace(v)).Int64(); err == nil {
+			n = i
+		}
+	}
+	if n < 0 {
+		return styles.Dim.Render("-")
+	}
+	return fmt.Sprintf("%dd", n)
+}
+
+func renderLastUsedForTable(attrs map[string]any, styles theme.Styles) string {
+	if attrs == nil {
+		return styles.Dim.Render("-")
+	}
+	if v, ok := attrs["last_used_at"].(string); ok {
+		v = strings.TrimSpace(v)
+		if v == "" || v == "-" {
+			return styles.Dim.Render("-")
+		}
+		return v
+	}
+	return styles.Dim.Render("-")
 }
 
 func renderStoredGiBForTable(attrs map[string]any, styles theme.Styles) string {
@@ -3052,7 +3117,7 @@ func renderStatusForTable(raw string, styles theme.Styles, ic icons.Set) string 
 	s := strings.ToLower(raw)
 	switch s {
 	// Good-ish.
-	case "running", "available", "active", "enabled", "attached", "inuse", "in-use", "ok", "healthy":
+	case "running", "available", "active", "enabled", "attached", "inuse", "in-use", "ok", "healthy", "console":
 		icon := ""
 		if ic != nil {
 			icon = icons.Pad(ic.Status(raw), 2)
@@ -3079,7 +3144,7 @@ func renderStatusForTable(raw string, styles theme.Styles, ic icons.Set) string 
 		}
 		return styles.Bad.Render(icon + raw)
 	// Neutral/dim.
-	case "stopped", "inactive", "disabled", "detached":
+	case "stopped", "inactive", "disabled", "detached", "programmatic", "unknown":
 		icon := ""
 		if ic != nil {
 			icon = icons.Pad(ic.Status(raw), 2)
@@ -3141,7 +3206,7 @@ func fallbackTypesForService(service string) []string {
 	case "elbv2":
 		return []string{"elbv2:load-balancer", "elbv2:target-group", "elbv2:listener", "elbv2:rule"}
 	case "iam":
-		return []string{"iam:role", "iam:policy"}
+		return []string{"iam:user", "iam:group", "iam:access-key", "iam:role", "iam:policy"}
 	case "s3":
 		return []string{"s3:bucket"}
 	case "rds":
@@ -3194,7 +3259,7 @@ func Run(ctx context.Context, st *store.Store, opts Options) error {
 		nav.ToggleExpandedService(selected)
 	}
 
-	resTable := table.New(table.WithColumns(buildResourceColumns(80, false, false)), table.WithRows(nil))
+	resTable := table.New(table.WithColumns(buildResourceColumns(80, false, false, false)), table.WithRows(nil))
 	resTable.SetStyles(table.DefaultStyles())
 
 	lens := graphlens.New()

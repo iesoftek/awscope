@@ -489,6 +489,37 @@ func TestStore_ListResourceSummariesByServiceTypeAndRegionsPaged_LogsOrderedBySt
 	}
 }
 
+func TestStore_ListResourceSummariesByServiceTypeAndRegionsPaged_IAMKeysOrderedByAgeDaysDesc(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test.sqlite")
+	st, err := Open(OpenOptions{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC()
+	nodes := []graph.ResourceNode{
+		{Key: graph.EncodeResourceKey("aws", "111111111111", "global", "iam:access-key", "AKIA1"), DisplayName: "u/AKIA1", Service: "iam", Type: "iam:access-key", PrimaryID: "AKIA1", Attributes: map[string]any{"age_days": 10, "status": "Active"}, CollectedAt: now, Source: "test"},
+		{Key: graph.EncodeResourceKey("aws", "111111111111", "global", "iam:access-key", "AKIA2"), DisplayName: "u/AKIA2", Service: "iam", Type: "iam:access-key", PrimaryID: "AKIA2", Attributes: map[string]any{"age_days": 30, "status": "Active"}, CollectedAt: now, Source: "test"},
+		{Key: graph.EncodeResourceKey("aws", "111111111111", "global", "iam:access-key", "AKIA3"), DisplayName: "u/AKIA3", Service: "iam", Type: "iam:access-key", PrimaryID: "AKIA3", Attributes: map[string]any{"age_days": 20, "status": "Inactive"}, CollectedAt: now, Source: "test"},
+	}
+	if err := st.UpsertResources(ctx, nodes); err != nil {
+		t.Fatalf("UpsertResources: %v", err)
+	}
+
+	ss, err := st.ListResourceSummariesByServiceTypeAndRegionsPaged(ctx, "111111111111", "iam", "iam:access-key", []string{"global"}, "", 50, 0)
+	if err != nil {
+		t.Fatalf("ListResourceSummariesByServiceTypeAndRegionsPaged: %v", err)
+	}
+	if len(ss) != 3 {
+		t.Fatalf("len: got %d want 3", len(ss))
+	}
+	if ss[0].PrimaryID != "AKIA2" || ss[1].PrimaryID != "AKIA3" || ss[2].PrimaryID != "AKIA1" {
+		t.Fatalf("order: got %q,%q,%q", ss[0].PrimaryID, ss[1].PrimaryID, ss[2].PrimaryID)
+	}
+}
+
 func TestStore_ListTypeCountsByServiceAndRegions(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "test.sqlite")
