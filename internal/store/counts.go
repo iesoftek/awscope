@@ -17,7 +17,7 @@ type TypeCount struct {
 }
 
 func (s *Store) ListServiceCountsByRegions(ctx context.Context, accountID string, regions []string) ([]ServiceCount, error) {
-	clauses := []string{}
+	clauses := []string{"lifecycle_state = 'active'"}
 	args := []any{}
 
 	accountID = strings.TrimSpace(accountID)
@@ -73,7 +73,7 @@ func (s *Store) ListTypeCountsByServiceAndRegions(ctx context.Context, accountID
 		return nil, nil
 	}
 
-	clauses := []string{"service = ?"}
+	clauses := []string{"service = ?", "lifecycle_state = 'active'"}
 	args := []any{service}
 	accountID = strings.TrimSpace(accountID)
 	if accountID != "" {

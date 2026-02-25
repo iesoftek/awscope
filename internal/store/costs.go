@@ -311,7 +311,7 @@ func (s *Store) listCostAgg(ctx context.Context, accountID string, regions []str
 	}
 
 	args := []any{accountID}
-	clauses := []string{"r.account_id = ?"}
+	clauses := []string{"r.account_id = ?", "r.lifecycle_state = 'active'"}
 
 	if strings.TrimSpace(service) != "" {
 		clauses = append(clauses, "r.service = ?")
@@ -388,7 +388,7 @@ func (s *Store) ListCostIndexTargets(ctx context.Context, accountID string, serv
 	}
 
 	args := []any{accountID, service}
-	clauses := []string{"r.account_id = ?", "r.service = ?"}
+	clauses := []string{"r.account_id = ?", "r.service = ?", "r.lifecycle_state = 'active'"}
 	if len(regions) > 0 {
 		holders := make([]string, 0, len(regions))
 		for _, rr := range regions {

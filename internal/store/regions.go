@@ -21,6 +21,7 @@ func (s *Store) ListRegionCountsByService(ctx context.Context, accountID string,
 SELECT region, COUNT(1)
 FROM resources
 WHERE service = ?
+  AND lifecycle_state = 'active'
 GROUP BY region
 ORDER BY region
 `
@@ -30,6 +31,7 @@ ORDER BY region
 SELECT region, COUNT(1)
 FROM resources
 WHERE service = ? AND account_id = ?
+  AND lifecycle_state = 'active'
 GROUP BY region
 ORDER BY region
 `
@@ -70,6 +72,7 @@ func (s *Store) ListRegionCountsByServiceType(ctx context.Context, accountID str
 SELECT region, COUNT(1)
 FROM resources
 WHERE service = ? AND type = ?
+  AND lifecycle_state = 'active'
 GROUP BY region
 ORDER BY region
 `
@@ -79,6 +82,7 @@ ORDER BY region
 SELECT region, COUNT(1)
 FROM resources
 WHERE service = ? AND type = ? AND account_id = ?
+  AND lifecycle_state = 'active'
 GROUP BY region
 ORDER BY region
 `

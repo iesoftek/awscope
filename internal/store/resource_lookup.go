@@ -26,7 +26,7 @@ func (s *Store) ListResourceLookupsByAccountAndRegions(ctx context.Context, acco
 	}
 
 	args := []any{accountID}
-	scope := "WHERE account_id = ?"
+	scope := "WHERE account_id = ? AND lifecycle_state = 'active'"
 	if len(regions) > 0 {
 		holders := make([]string, 0, len(regions))
 		for _, r := range regions {

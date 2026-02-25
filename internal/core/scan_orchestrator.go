@@ -2,6 +2,9 @@ package core
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -51,6 +54,34 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 	_ = a.store.UpsertAccountSeen(ctx, id.AccountID, id.Partition, now)
 	_ = a.store.UpsertProfileUsed(ctx, profileName, id.AccountID, now)
 
+	stalePolicy := opts.StalePolicy
+	if stalePolicy == "" {
+		stalePolicy = StalePolicyHide
+	}
+	if stalePolicy != StalePolicyHide && stalePolicy != StalePolicyOff {
+		return ScanResult{}, fmt.Errorf("invalid stale policy %q", stalePolicy)
+	}
+
+	scanID := newScanID()
+	scopeJSONBytes, _ := json.Marshal(map[string]any{
+		"profile":        profileName,
+		"account_id":     id.AccountID,
+		"partition":      id.Partition,
+		"regions":        opts.Regions,
+		"provider_ids":   opts.ProviderIDs,
+		"stale_policy":   stalePolicy,
+		"started_at_rfc": now.Format(time.RFC3339Nano),
+	})
+	_ = a.store.StartScanRun(ctx, scanID, profileName, string(scopeJSONBytes), now)
+	scanSucceeded := false
+	defer func() {
+		status := "failed"
+		if scanSucceeded {
+			status = "success"
+		}
+		_ = a.store.FinishScanRun(context.Background(), scanID, status, time.Now().UTC())
+	}()
+
 	var (
 		nodesSoFar int64
 		edgesSoFar int64
@@ -91,6 +122,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 
 	// Collect target groups discovered during scan so we can resolve instance membership later.
 	tgsByRegion := map[string][]string{}
+	successfulScopes := map[string]map[string]struct{}{}
 	var failures []ScanStepFailure
 	serviceCounts := map[string]int{}
 	regionCounts := map[string]int{}
@@ -183,6 +215,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 	type scanTask struct {
 		phase      ScanProgressPhase
 		providerID string
+		scope      providers.ScopeKind
 		stepRegion string
 		startMsg   string
 		reqRegions []string
@@ -236,7 +269,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 				continue
 			}
 
-			if err := a.store.UpsertResources(ctx2, r.res.Nodes); err != nil {
+			if err := a.store.UpsertResourcesWithScan(ctx2, r.res.Nodes, scanID); err != nil {
 				select {
 				case writerErrCh <- err:
 				default:
@@ -255,6 +288,18 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 
 			atomic.AddInt64(&nodesSoFar, int64(len(r.res.Nodes)))
 			atomic.AddInt64(&edgesSoFar, int64(len(r.res.Edges)))
+
+			scopeRegions := successfulScopeRegions(r.task.scope, r.task.stepRegion, r.task.reqRegions)
+			if len(scopeRegions) > 0 {
+				byRegion, ok := successfulScopes[r.task.providerID]
+				if !ok {
+					byRegion = map[string]struct{}{}
+					successfulScopes[r.task.providerID] = byRegion
+				}
+				for _, region := range scopeRegions {
+					byRegion[region] = struct{}{}
+				}
+			}
 
 			for _, n := range r.res.Nodes {
 				svc := strings.TrimSpace(n.Service)
@@ -323,6 +368,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 			tasks = append(tasks, scanTask{
 				phase:      PhaseProvider,
 				providerID: pid,
+				scope:      providers.ScopeGlobal,
 				stepRegion: "global",
 				startMsg:   "listing global resources",
 				reqRegions: []string{"global"},
@@ -342,6 +388,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 			tasks = append(tasks, scanTask{
 				phase:      PhaseProvider,
 				providerID: pid,
+				scope:      providers.ScopeAccount,
 				stepRegion: "account",
 				startMsg:   "listing account resources",
 				reqRegions: reqRegions,
@@ -362,6 +409,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 				tasks = append(tasks, scanTask{
 					phase:      PhaseProvider,
 					providerID: pid,
+					scope:      providers.ScopeRegional,
 					stepRegion: region,
 					startMsg:   "listing regional resources",
 					reqRegions: []string{region},
@@ -441,6 +489,36 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 		return ScanResult{}, workerErr
 	}
 	phaseDurations[PhaseProvider] = time.Since(providerStageStartedAt)
+
+	if stalePolicy == StalePolicyHide {
+		scopes := make([]store.ScanScope, 0, len(successfulScopes))
+		for service, regionsSet := range successfulScopes {
+			if strings.TrimSpace(service) == "" || len(regionsSet) == 0 {
+				continue
+			}
+			regions := make([]string, 0, len(regionsSet))
+			for region := range regionsSet {
+				region = strings.TrimSpace(region)
+				if region == "" {
+					continue
+				}
+				regions = append(regions, region)
+			}
+			if len(regions) == 0 {
+				continue
+			}
+			sort.Strings(regions)
+			scopes = append(scopes, store.ScanScope{
+				Service: service,
+				Regions: regions,
+			})
+		}
+		if len(scopes) > 0 {
+			if _, err := a.store.MarkResourcesStaleNotSeenInScopes(ctx2, id.AccountID, scanID, scopes, time.Now().UTC()); err != nil {
+				return ScanResult{}, err
+			}
+		}
+	}
 
 	// Resolver: instance -> target group membership (full mapping v1 slice).
 	if needsResolver {
@@ -1076,13 +1154,52 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 		SlowSteps:      slowSteps,
 	}
 
+	scanSucceeded = true
 	return ScanResult{
 		Resources:    int(atomic.LoadInt64(&nodesSoFar)),
 		Edges:        int(atomic.LoadInt64(&edgesSoFar)),
 		AccountID:    id.AccountID,
 		Partition:    id.Partition,
+		ScanID:       scanID,
 		StepFailures: failures,
 		Summary:      summary,
 		Performance:  perf,
 	}, nil
+}
+
+func successfulScopeRegions(scope providers.ScopeKind, stepRegion string, reqRegions []string) []string {
+	seen := map[string]struct{}{}
+	add := func(region string) {
+		region = strings.TrimSpace(region)
+		if region == "" {
+			return
+		}
+		seen[region] = struct{}{}
+	}
+
+	switch scope {
+	case providers.ScopeGlobal:
+		add("global")
+	case providers.ScopeAccount:
+		for _, region := range reqRegions {
+			add(region)
+		}
+		add("global")
+	default:
+		add(stepRegion)
+	}
+
+	out := make([]string, 0, len(seen))
+	for region := range seen {
+		out = append(out, region)
+	}
+	return out
+}
+
+func newScanID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("scan-%d", time.Now().UTC().UnixNano())
+	}
+	return fmt.Sprintf("scan-%d-%s", time.Now().UTC().UnixNano(), hex.EncodeToString(b[:]))
 }

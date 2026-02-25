@@ -37,6 +37,7 @@ type ScanOptions struct {
 	Profile     string
 	Regions     []string
 	ProviderIDs []string
+	StalePolicy StalePolicy
 
 	MaxConcurrency               int
 	ResolverConcurrency          int
@@ -47,6 +48,13 @@ type ScanOptions struct {
 	CostConcurrency              int
 	TargetDuration               time.Duration
 }
+
+type StalePolicy string
+
+const (
+	StalePolicyHide StalePolicy = "hide"
+	StalePolicyOff  StalePolicy = "off"
+)
 
 type ScanServiceCount struct {
 	Service   string
@@ -76,6 +84,7 @@ type ScanResult struct {
 	Edges     int
 	AccountID string
 	Partition string
+	ScanID    string
 
 	// StepFailures contains best-effort step errors (e.g. AccessDenied) encountered during scan.
 	// The scan still completes successfully when these are present.

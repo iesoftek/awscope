@@ -49,7 +49,7 @@ FROM (
     r.primary_id AS primary_id,
     r.arn AS arn
   FROM edges e
-  LEFT JOIN resources r ON r.resource_key = e.to_key
+  LEFT JOIN resources r ON r.resource_key = e.to_key AND r.lifecycle_state = 'active'
   WHERE e.from_key = ?
 
   UNION ALL
@@ -66,7 +66,7 @@ FROM (
     r.primary_id AS primary_id,
     r.arn AS arn
   FROM edges e
-  LEFT JOIN resources r ON r.resource_key = e.from_key
+  LEFT JOIN resources r ON r.resource_key = e.from_key AND r.lifecycle_state = 'active'
   WHERE e.to_key = ?
 )
 `, string(key), string(key))

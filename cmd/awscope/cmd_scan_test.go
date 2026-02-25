@@ -103,6 +103,12 @@ func TestNewScanCmd_DefaultFlagsAndNoCloudTrail(t *testing.T) {
 	if f := cmd.Flags().Lookup("no-cloudtrail"); f == nil {
 		t.Fatalf("expected --no-cloudtrail flag")
 	}
+	if f := cmd.Flags().Lookup("stale-policy"); f == nil {
+		t.Fatalf("expected --stale-policy flag")
+	}
+	if got := cmd.Flags().Lookup("stale-policy").DefValue; got != "hide" {
+		t.Fatalf("stale-policy default: got %q want %q", got, "hide")
+	}
 	if got := cmd.Flags().Lookup("concurrency").DefValue; got != "16" {
 		t.Fatalf("concurrency default: got %q want %q", got, "16")
 	}

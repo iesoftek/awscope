@@ -22,6 +22,7 @@ type Options struct {
 	Profile     string
 	Regions     []string
 	ProviderIDs []string
+	StalePolicy core.StalePolicy
 
 	MaxConcurrency               int
 	ResolverConcurrency          int
@@ -101,6 +102,7 @@ func Run(ctx context.Context, st *store.Store, opts Options) (core.ScanResult, e
 			Profile:                      opts.Profile,
 			Regions:                      opts.Regions,
 			ProviderIDs:                  opts.ProviderIDs,
+			StalePolicy:                  opts.StalePolicy,
 			MaxConcurrency:               opts.MaxConcurrency,
 			ResolverConcurrency:          opts.ResolverConcurrency,
 			AuditRegionConcurrency:       opts.AuditRegionConcurrency,
@@ -169,6 +171,7 @@ func (m *model) Init() tea.Cmd {
 			Profile:                      m.opts.Profile,
 			Regions:                      m.opts.Regions,
 			ProviderIDs:                  m.opts.ProviderIDs,
+			StalePolicy:                  m.opts.StalePolicy,
 			MaxConcurrency:               m.opts.MaxConcurrency,
 			ResolverConcurrency:          m.opts.ResolverConcurrency,
 			AuditRegionConcurrency:       m.opts.AuditRegionConcurrency,

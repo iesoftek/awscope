@@ -673,3 +673,196 @@ func TestStore_ListRegionCountsByServiceAndType(t *testing.T) {
 		t.Fatalf("type counts: got %#v", gotTyp)
 	}
 }
+
+func TestStore_UpsertResourcesWithScan_SetsLifecycleAndReactivates(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test.sqlite")
+	st, err := Open(OpenOptions{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	key := graph.EncodeResourceKey("aws", "123456789012", "us-east-1", "ec2:instance", "i-1")
+	node := graph.ResourceNode{
+		Key:         key,
+		DisplayName: "web-1",
+		Service:     "ec2",
+		Type:        "ec2:instance",
+		PrimaryID:   "i-1",
+		CollectedAt: time.Now().UTC(),
+		Source:      "test",
+	}
+	if err := st.UpsertResourcesWithScan(ctx, []graph.ResourceNode{node}, "scan-a"); err != nil {
+		t.Fatalf("UpsertResourcesWithScan(scan-a): %v", err)
+	}
+
+	var state, lastSeen string
+	var missing any
+	if err := st.db.QueryRowContext(ctx, `SELECT lifecycle_state, COALESCE(last_seen_scan_id, ''), missing_since FROM resources WHERE resource_key = ?`, string(key)).Scan(&state, &lastSeen, &missing); err != nil {
+		t.Fatalf("select lifecycle (1): %v", err)
+	}
+	if state != "active" || lastSeen != "scan-a" || missing != nil {
+		t.Fatalf("unexpected lifecycle(1): state=%q lastSeen=%q missing=%v", state, lastSeen, missing)
+	}
+
+	if _, err := st.MarkResourcesStaleNotSeenInScopes(ctx, "123456789012", "scan-b", []ScanScope{{Service: "ec2", Regions: []string{"us-east-1"}}}, time.Now().UTC()); err != nil {
+		t.Fatalf("MarkResourcesStaleNotSeenInScopes: %v", err)
+	}
+
+	if err := st.db.QueryRowContext(ctx, `SELECT lifecycle_state FROM resources WHERE resource_key = ?`, string(key)).Scan(&state); err != nil {
+		t.Fatalf("select lifecycle (2): %v", err)
+	}
+	if state != "stale" {
+		t.Fatalf("expected stale after mark, got %q", state)
+	}
+
+	if err := st.UpsertResourcesWithScan(ctx, []graph.ResourceNode{node}, "scan-c"); err != nil {
+		t.Fatalf("UpsertResourcesWithScan(scan-c): %v", err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT lifecycle_state, COALESCE(last_seen_scan_id, ''), missing_since FROM resources WHERE resource_key = ?`, string(key)).Scan(&state, &lastSeen, &missing); err != nil {
+		t.Fatalf("select lifecycle (3): %v", err)
+	}
+	if state != "active" || lastSeen != "scan-c" || missing != nil {
+		t.Fatalf("unexpected lifecycle(3): state=%q lastSeen=%q missing=%v", state, lastSeen, missing)
+	}
+}
+
+func TestStore_MarkResourcesStaleNotSeenInScopes_Scoped(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test.sqlite")
+	st, err := Open(OpenOptions{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC()
+	nodes := []graph.ResourceNode{
+		{Key: graph.EncodeResourceKey("aws", "111111111111", "us-east-1", "ec2:instance", "i-1"), DisplayName: "i-1", Service: "ec2", Type: "ec2:instance", PrimaryID: "i-1", CollectedAt: now, Source: "test"},
+		{Key: graph.EncodeResourceKey("aws", "111111111111", "us-west-2", "ec2:instance", "i-2"), DisplayName: "i-2", Service: "ec2", Type: "ec2:instance", PrimaryID: "i-2", CollectedAt: now, Source: "test"},
+		{Key: graph.EncodeResourceKey("aws", "111111111111", "us-east-1", "ecs:service", "svc-1"), DisplayName: "svc-1", Service: "ecs", Type: "ecs:service", PrimaryID: "svc-1", CollectedAt: now, Source: "test"},
+		{Key: graph.EncodeResourceKey("aws", "222222222222", "us-east-1", "ec2:instance", "i-3"), DisplayName: "i-3", Service: "ec2", Type: "ec2:instance", PrimaryID: "i-3", CollectedAt: now, Source: "test"},
+	}
+	if err := st.UpsertResourcesWithScan(ctx, nodes, "scan-a"); err != nil {
+		t.Fatalf("UpsertResourcesWithScan: %v", err)
+	}
+	// Only east ec2 resource is seen in scan-b.
+	if err := st.UpsertResourcesWithScan(ctx, nodes[:1], "scan-b"); err != nil {
+		t.Fatalf("UpsertResourcesWithScan(scan-b): %v", err)
+	}
+
+	n, err := st.MarkResourcesStaleNotSeenInScopes(ctx, "111111111111", "scan-b", []ScanScope{{Service: "ec2", Regions: []string{"us-east-1", "us-west-2"}}}, now)
+	if err != nil {
+		t.Fatalf("MarkResourcesStaleNotSeenInScopes: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("stale count: got %d want 1", n)
+	}
+
+	var stateEast, stateWest, stateECS, stateOther string
+	if err := st.db.QueryRowContext(ctx, `SELECT lifecycle_state FROM resources WHERE resource_key = ?`, string(nodes[0].Key)).Scan(&stateEast); err != nil {
+		t.Fatalf("state east: %v", err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT lifecycle_state FROM resources WHERE resource_key = ?`, string(nodes[1].Key)).Scan(&stateWest); err != nil {
+		t.Fatalf("state west: %v", err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT lifecycle_state FROM resources WHERE resource_key = ?`, string(nodes[2].Key)).Scan(&stateECS); err != nil {
+		t.Fatalf("state ecs: %v", err)
+	}
+	if err := st.db.QueryRowContext(ctx, `SELECT lifecycle_state FROM resources WHERE resource_key = ?`, string(nodes[3].Key)).Scan(&stateOther); err != nil {
+		t.Fatalf("state other: %v", err)
+	}
+	if stateEast != "active" || stateWest != "stale" || stateECS != "active" || stateOther != "active" {
+		t.Fatalf("unexpected states east=%s west=%s ecs=%s other=%s", stateEast, stateWest, stateECS, stateOther)
+	}
+}
+
+func TestStore_ActiveQueriesExcludeStaleByDefault(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test.sqlite")
+	st, err := Open(OpenOptions{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC()
+	active := graph.ResourceNode{Key: graph.EncodeResourceKey("aws", "111111111111", "us-east-1", "ec2:instance", "i-active"), DisplayName: "active", Service: "ec2", Type: "ec2:instance", PrimaryID: "i-active", CollectedAt: now, Source: "test"}
+	stale := graph.ResourceNode{Key: graph.EncodeResourceKey("aws", "111111111111", "us-east-1", "ec2:instance", "i-stale"), DisplayName: "stale", Service: "ec2", Type: "ec2:instance", PrimaryID: "i-stale", CollectedAt: now, Source: "test"}
+	if err := st.UpsertResourcesWithScan(ctx, []graph.ResourceNode{active, stale}, "scan-a"); err != nil {
+		t.Fatalf("UpsertResourcesWithScan: %v", err)
+	}
+	if _, err := st.MarkResourcesStaleNotSeenInScopes(ctx, "111111111111", "scan-b", []ScanScope{{Service: "ec2", Regions: []string{"us-east-1"}}}, now); err != nil {
+		t.Fatalf("MarkResourcesStaleNotSeenInScopes: %v", err)
+	}
+	// Re-seen active node for scan-b.
+	if err := st.UpsertResourcesWithScan(ctx, []graph.ResourceNode{active}, "scan-b"); err != nil {
+		t.Fatalf("UpsertResourcesWithScan(scan-b): %v", err)
+	}
+
+	total, err := st.CountResourceSummariesByServiceTypeAndRegions(ctx, "111111111111", "ec2", "ec2:instance", []string{"us-east-1"}, "")
+	if err != nil {
+		t.Fatalf("CountResourceSummariesByServiceTypeAndRegions: %v", err)
+	}
+	if total != 1 {
+		t.Fatalf("count: got %d want 1", total)
+	}
+
+	ss, err := st.ListResourceSummariesByServiceTypeAndRegionsPaged(ctx, "111111111111", "ec2", "ec2:instance", []string{"us-east-1"}, "", 20, 0)
+	if err != nil {
+		t.Fatalf("ListResourceSummariesByServiceTypeAndRegionsPaged: %v", err)
+	}
+	if len(ss) != 1 || ss[0].PrimaryID != "i-active" {
+		t.Fatalf("summaries: %#v", ss)
+	}
+}
+
+func TestStore_PurgeStaleResources(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test.sqlite")
+	st, err := Open(OpenOptions{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC()
+	active := graph.ResourceNode{Key: graph.EncodeResourceKey("aws", "111111111111", "us-east-1", "ec2:instance", "i-active"), DisplayName: "active", Service: "ec2", Type: "ec2:instance", PrimaryID: "i-active", CollectedAt: now, Source: "test"}
+	stale := graph.ResourceNode{Key: graph.EncodeResourceKey("aws", "111111111111", "us-east-1", "ec2:instance", "i-stale"), DisplayName: "stale", Service: "ec2", Type: "ec2:instance", PrimaryID: "i-stale", CollectedAt: now, Source: "test"}
+	if err := st.UpsertResourcesWithScan(ctx, []graph.ResourceNode{active, stale}, "scan-a"); err != nil {
+		t.Fatalf("UpsertResourcesWithScan: %v", err)
+	}
+	if _, err := st.MarkResourcesStaleNotSeenInScopes(ctx, "111111111111", "scan-b", []ScanScope{{Service: "ec2", Regions: []string{"us-east-1"}}}, now); err != nil {
+		t.Fatalf("MarkResourcesStaleNotSeenInScopes: %v", err)
+	}
+	if err := st.UpsertResourcesWithScan(ctx, []graph.ResourceNode{active}, "scan-b"); err != nil {
+		t.Fatalf("UpsertResourcesWithScan(scan-b): %v", err)
+	}
+	if err := st.UpsertEdges(ctx, []graph.RelationshipEdge{{From: active.Key, To: stale.Key, Kind: "uses", CollectedAt: now}}); err != nil {
+		t.Fatalf("UpsertEdges: %v", err)
+	}
+	usd := 10.0
+	if err := st.UpsertResourceCosts(ctx, []ResourceCostRow{
+		{ResourceKey: active.Key, AccountID: "111111111111", Partition: "aws", Region: "us-east-1", Service: "ec2", Type: "ec2:instance", EstMonthlyUSD: &usd, Currency: "USD", Basis: "test", ComputedAt: now, Source: "test"},
+		{ResourceKey: stale.Key, AccountID: "111111111111", Partition: "aws", Region: "us-east-1", Service: "ec2", Type: "ec2:instance", EstMonthlyUSD: &usd, Currency: "USD", Basis: "test", ComputedAt: now, Source: "test"},
+	}); err != nil {
+		t.Fatalf("UpsertResourceCosts: %v", err)
+	}
+
+	deletedResources, deletedEdges, deletedCosts, err := st.PurgeStaleResources(ctx, "111111111111", nil)
+	if err != nil {
+		t.Fatalf("PurgeStaleResources: %v", err)
+	}
+	if deletedResources != 1 || deletedEdges != 1 || deletedCosts != 1 {
+		t.Fatalf("deleted counts: resources=%d edges=%d costs=%d", deletedResources, deletedEdges, deletedCosts)
+	}
+
+	var n int
+	if err := st.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM resources WHERE resource_key = ?`, string(stale.Key)).Scan(&n); err != nil {
+		t.Fatalf("count stale resource: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("stale resource not deleted")
+	}
+}

@@ -82,8 +82,10 @@ LEFT JOIN resource_costs c ON c.resource_key = r.resource_key AND c.account_id =
 `
 	args := []any{}
 	if accountID != "" {
-		q += "WHERE r.account_id = ?\n"
+		q += "WHERE r.account_id = ? AND r.lifecycle_state = 'active'\n"
 		args = append(args, accountID)
+	} else {
+		q += "WHERE r.lifecycle_state = 'active'\n"
 	}
 	q += "ORDER BY r.account_id, r.service, r.type, r.region, r.display_name\n"
 

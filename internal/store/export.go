@@ -84,6 +84,7 @@ SELECT
   tags_json, attributes_json, raw_json,
   collected_at, updated_at
 FROM resources
+WHERE lifecycle_state = 'active'
 ORDER BY resource_key
 `)
 	if err != nil {
@@ -153,7 +154,7 @@ SELECT
   tags_json, attributes_json, raw_json,
   collected_at, updated_at
 FROM resources
-WHERE account_id = ?
+WHERE account_id = ? AND lifecycle_state = 'active'
 ORDER BY resource_key
 `, accountID)
 	if err != nil {
@@ -217,8 +218,11 @@ ORDER BY resource_key
 
 func (s *Store) exportEdges(ctx context.Context) ([]ExportEdge, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT from_key, to_key, kind, meta_json, collected_at
-FROM edges
+SELECT e.from_key, e.to_key, e.kind, e.meta_json, e.collected_at
+FROM edges e
+JOIN resources rf ON rf.resource_key = e.from_key
+JOIN resources rt ON rt.resource_key = e.to_key
+WHERE rf.lifecycle_state = 'active' AND rt.lifecycle_state = 'active'
 ORDER BY from_key, kind, to_key
 `)
 	if err != nil {
@@ -249,14 +253,15 @@ ORDER BY from_key, kind, to_key
 }
 
 func (s *Store) exportEdgesByAccount(ctx context.Context, accountID string) ([]ExportEdge, error) {
-	// Resource keys embed account id in the key string. Filter edges by prefix match.
-	like := "%|" + accountID + "|%"
 	rows, err := s.db.QueryContext(ctx, `
-SELECT from_key, to_key, kind, meta_json, collected_at
-FROM edges
-WHERE from_key LIKE ? OR to_key LIKE ?
-ORDER BY from_key, kind, to_key
-`, like, like)
+SELECT e.from_key, e.to_key, e.kind, e.meta_json, e.collected_at
+FROM edges e
+JOIN resources rf ON rf.resource_key = e.from_key
+JOIN resources rt ON rt.resource_key = e.to_key
+WHERE rf.account_id = ? AND rt.account_id = ?
+  AND rf.lifecycle_state = 'active' AND rt.lifecycle_state = 'active'
+ORDER BY e.from_key, e.kind, e.to_key
+`, accountID, accountID)
 	if err != nil {
 		return nil, err
 	}

@@ -27,7 +27,7 @@ SELECT
   c.est_monthly_usd, c.basis
 FROM resources r
 LEFT JOIN resource_costs c ON c.resource_key = r.resource_key
-WHERE r.account_id = ? AND r.region = ?
+WHERE r.account_id = ? AND r.region = ? AND r.lifecycle_state = 'active'
 ORDER BY r.service ASC, r.type ASC, r.display_name ASC
 `, accountID, region)
 	if err != nil {
@@ -118,6 +118,7 @@ FROM edges e
 JOIN resources rf ON rf.resource_key = e.from_key
 JOIN resources rt ON rt.resource_key = e.to_key
 WHERE rf.account_id = ? AND rt.account_id = ?
+  AND rf.lifecycle_state = 'active' AND rt.lifecycle_state = 'active'
   AND (
     (rf.region = ? AND rt.region = 'global') OR
     (rf.region = 'global' AND rt.region = ?)
@@ -186,6 +187,7 @@ SELECT
 FROM resources r
 LEFT JOIN resource_costs c ON c.resource_key = r.resource_key
 WHERE r.resource_key IN (%s)
+  AND r.lifecycle_state = 'active'
 ORDER BY r.service ASC, r.type ASC, r.display_name ASC
 `, strings.Join(holders, ","))
 	resRows, err := s.db.QueryContext(ctx, q, args...)

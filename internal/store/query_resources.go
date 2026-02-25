@@ -12,7 +12,7 @@ import (
 )
 
 func (s *Store) CountResources(ctx context.Context) (int, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM resources`)
+	row := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM resources WHERE lifecycle_state = 'active'`)
 	var n int
 	if err := row.Scan(&n); err != nil {
 		return 0, err
@@ -34,6 +34,7 @@ SELECT
   c.est_monthly_usd, c.basis
 FROM resources r
 LEFT JOIN resource_costs c ON c.resource_key = r.resource_key
+WHERE r.lifecycle_state = 'active'
 ORDER BY r.updated_at DESC
 LIMIT ?
 `, limit)
@@ -128,6 +129,7 @@ func (s *Store) CountResourcesByType(ctx context.Context) ([]ServiceTypeCount, e
 	rows, err := s.db.QueryContext(ctx, `
 SELECT service, type, COUNT(1)
 FROM resources
+WHERE lifecycle_state = 'active'
 GROUP BY service, type
 ORDER BY service, type
 `)
@@ -151,7 +153,7 @@ ORDER BY service, type
 }
 
 func (s *Store) CountResourcesByService(ctx context.Context, service string) (int, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM resources WHERE service = ?`, service)
+	row := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM resources WHERE service = ? AND lifecycle_state = 'active'`, service)
 	var n int
 	if err := row.Scan(&n); err != nil {
 		return 0, err
@@ -195,6 +197,7 @@ SELECT
 FROM resources r
 LEFT JOIN resource_costs c ON c.resource_key = r.resource_key
 WHERE r.service = ?
+  AND r.lifecycle_state = 'active'
   AND (
     r.display_name LIKE ?
     OR r.primary_id LIKE ?
@@ -298,6 +301,7 @@ func (s *Store) CountResourceSummariesByServiceAndRegions(ctx context.Context, s
 SELECT COUNT(1)
 FROM resources
 WHERE service = ?
+  AND lifecycle_state = 'active'
   AND (
     display_name LIKE ?
     OR primary_id LIKE ?
@@ -351,6 +355,7 @@ SELECT
 FROM resources r
 LEFT JOIN resource_costs c ON c.resource_key = r.resource_key
 WHERE r.service = ?
+  AND r.lifecycle_state = 'active'
   AND (
     r.display_name LIKE ?
     OR r.primary_id LIKE ?
@@ -468,6 +473,7 @@ SELECT
 FROM resources r
 LEFT JOIN resource_costs c ON c.resource_key = r.resource_key
 WHERE r.resource_key IN (%s)
+  AND r.lifecycle_state = 'active'
 `, strings.Join(holders, ","))
 
 		rows, err := s.db.QueryContext(ctx, q, args...)

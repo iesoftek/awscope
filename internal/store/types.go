@@ -12,7 +12,7 @@ import (
 )
 
 func (s *Store) ListDistinctTypesByServiceAndRegions(ctx context.Context, accountID string, service string, regions []string) ([]string, error) {
-	clauses := []string{"service = ?"}
+	clauses := []string{"service = ?", "lifecycle_state = 'active'"}
 	args := []any{service}
 	accountID = strings.TrimSpace(accountID)
 	if accountID != "" {
@@ -67,7 +67,7 @@ func (s *Store) CountResourceSummariesByServiceTypeAndRegions(ctx context.Contex
 
 	accountID = strings.TrimSpace(accountID)
 	args := []any{service, typ}
-	scope := "WHERE r.service = ? AND r.type = ?"
+	scope := "WHERE r.service = ? AND r.type = ? AND r.lifecycle_state = 'active'"
 	if accountID != "" {
 		scope += " AND r.account_id = ?"
 		args = append(args, accountID)
@@ -124,7 +124,7 @@ func (s *Store) ListResourceSummariesByServiceTypeAndRegionsPaged(ctx context.Co
 
 	accountID = strings.TrimSpace(accountID)
 	args := []any{service, typ}
-	scope := "WHERE r.service = ? AND r.type = ?"
+	scope := "WHERE r.service = ? AND r.type = ? AND r.lifecycle_state = 'active'"
 	if accountID != "" {
 		scope += " AND r.account_id = ?"
 		args = append(args, accountID)

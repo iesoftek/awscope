@@ -32,6 +32,10 @@ type ResourceSummary struct {
 }
 
 func (s *Store) UpsertResources(ctx context.Context, nodes []graph.ResourceNode) error {
+	return s.UpsertResourcesWithScan(ctx, nodes, "")
+}
+
+func (s *Store) UpsertResourcesWithScan(ctx context.Context, nodes []graph.ResourceNode, scanID string) error {
 	if len(nodes) == 0 {
 		return nil
 	}
@@ -50,12 +54,14 @@ INSERT INTO resources(
   resource_key, account_id, partition, region, service, type,
   arn, primary_id, display_name,
   tags_json, attributes_json, raw_json,
-  collected_at, updated_at
+  collected_at, updated_at,
+  lifecycle_state, last_seen_scan_id, missing_since
 ) VALUES (
   ?, ?, ?, ?, ?, ?,
   ?, ?, ?,
   ?, ?, ?,
-  ?, ?
+  ?, ?,
+  ?, ?, ?
 )
 ON CONFLICT(resource_key) DO UPDATE SET
   account_id=excluded.account_id,
@@ -70,7 +76,13 @@ ON CONFLICT(resource_key) DO UPDATE SET
   attributes_json=excluded.attributes_json,
   raw_json=excluded.raw_json,
   collected_at=excluded.collected_at,
-  updated_at=excluded.updated_at
+  updated_at=excluded.updated_at,
+  lifecycle_state='active',
+  last_seen_scan_id=CASE
+    WHEN excluded.last_seen_scan_id IS NULL OR excluded.last_seen_scan_id = '' THEN resources.last_seen_scan_id
+    ELSE excluded.last_seen_scan_id
+  END,
+  missing_since=NULL
 `)
 	if err != nil {
 		return err
@@ -84,14 +96,23 @@ INSERT INTO resources(
   resource_key, account_id, partition, region, service, type,
   arn, primary_id, display_name,
   tags_json, attributes_json, raw_json,
-  collected_at, updated_at
+  collected_at, updated_at,
+  lifecycle_state, last_seen_scan_id, missing_since
 ) VALUES (
   ?, ?, ?, ?, ?, ?,
   ?, ?, ?,
   ?, ?, ?,
-  ?, ?
+  ?, ?,
+  ?, ?, ?
 )
-ON CONFLICT(resource_key) DO NOTHING
+ON CONFLICT(resource_key) DO UPDATE SET
+  lifecycle_state='active',
+  last_seen_scan_id=CASE
+    WHEN excluded.last_seen_scan_id IS NULL OR excluded.last_seen_scan_id = '' THEN resources.last_seen_scan_id
+    ELSE excluded.last_seen_scan_id
+  END,
+  missing_since=NULL,
+  updated_at=excluded.updated_at
 `)
 	if err != nil {
 		return err
@@ -137,6 +158,7 @@ ON CONFLICT(resource_key) DO NOTHING
 			nullIfEmpty(n.Arn), primaryID, n.DisplayName,
 			string(tagsJSON), string(attrsJSON), string(raw),
 			collectedAt.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano),
+			"active", nullIfEmpty(strings.TrimSpace(scanID)), nil,
 		); err != nil {
 			return err
 		}

@@ -21,6 +21,7 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 		regions                      string
 		services                     string
 		noCloudTrail                 bool
+		stalePolicy                  string
 		plain                        bool
 		concurrency                  int
 		resolverConcurrency          int
@@ -86,6 +87,14 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 			if len(serviceIDs) == 0 {
 				return fmt.Errorf("no services/providers selected after filtering")
 			}
+			stalePolicy = strings.TrimSpace(strings.ToLower(stalePolicy))
+			switch stalePolicy {
+			case "", string(core.StalePolicyHide):
+				stalePolicy = string(core.StalePolicyHide)
+			case string(core.StalePolicyOff):
+			default:
+				return fmt.Errorf("invalid --stale-policy %q (expected hide|off)", stalePolicy)
+			}
 			// Validate early for a clearer error.
 			for _, sid := range serviceIDs {
 				if _, ok := registry.Get(sid); !ok {
@@ -100,6 +109,7 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 					Profile:                      profile,
 					Regions:                      regionList,
 					ProviderIDs:                  serviceIDs,
+					StalePolicy:                  core.StalePolicy(stalePolicy),
 					MaxConcurrency:               concurrency,
 					ResolverConcurrency:          resolverConcurrency,
 					AuditRegionConcurrency:       auditRegionConcurrency,
@@ -114,6 +124,7 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 					Profile:                      profile,
 					Regions:                      regionList,
 					ProviderIDs:                  serviceIDs,
+					StalePolicy:                  core.StalePolicy(stalePolicy),
 					MaxConcurrency:               concurrency,
 					ResolverConcurrency:          resolverConcurrency,
 					AuditRegionConcurrency:       auditRegionConcurrency,
@@ -149,6 +160,7 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 	cmd.Flags().StringVar(&profile, "profile", "", "AWS profile name (uses default chain if empty)")
 	cmd.Flags().StringVar(&regions, "regions", "", "Comma-separated regions to scan (required; supports 'all')")
 	cmd.Flags().BoolVar(&noCloudTrail, "no-cloudtrail", false, "Exclude CloudTrail provider/event indexing from scan")
+	cmd.Flags().StringVar(&stalePolicy, "stale-policy", string(core.StalePolicyHide), "Resource stale policy after scan: hide|off")
 	servicesUsage := "Comma-separated service/provider IDs to scan (default: all supported)"
 	if known := registry.ListIDs(); len(known) > 0 {
 		sort.Strings(known)

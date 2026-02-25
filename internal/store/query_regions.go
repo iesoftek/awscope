@@ -7,10 +7,10 @@ import (
 
 func (s *Store) ListDistinctRegions(ctx context.Context, accountID string) ([]string, error) {
 	accountID = strings.TrimSpace(accountID)
-	q := `SELECT DISTINCT region FROM resources ORDER BY region`
+	q := `SELECT DISTINCT region FROM resources WHERE lifecycle_state = 'active' ORDER BY region`
 	args := []any{}
 	if accountID != "" {
-		q = `SELECT DISTINCT region FROM resources WHERE account_id = ? ORDER BY region`
+		q = `SELECT DISTINCT region FROM resources WHERE account_id = ? AND lifecycle_state = 'active' ORDER BY region`
 		args = append(args, accountID)
 	}
 	rows, err := s.db.QueryContext(ctx, q, args...)
