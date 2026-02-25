@@ -20,16 +20,42 @@ Go 1.25+:
 go run ./cmd/awscope --help
 ```
 
-Run the TUI (defaults to `tui` if you omit subcommand):
+## Quickstart
+
+Initial full scan:
+
+```sh
+go run ./cmd/awscope scan --profile default --regions all
+```
+
+Open inventory TUI (defaults to `tui` if subcommand is omitted):
 
 ```sh
 go run ./cmd/awscope tui --profile default
 ```
 
-Run the interactive security viewer:
+Open interactive security findings viewer:
 
 ```sh
 go run ./cmd/awscope security --profile default --tui
+```
+
+Print security findings in text mode:
+
+```sh
+go run ./cmd/awscope security --profile default
+```
+
+Export resources to CSV:
+
+```sh
+go run ./cmd/awscope export --format csv --profile default
+```
+
+Generate a region architecture diagram:
+
+```sh
+go run ./cmd/awscope diagram --profile default --region us-east-1 --format both
 ```
 
 ## Scan
@@ -75,120 +101,6 @@ Supported services (as of this repo state):
 
 - `accessanalyzer, acm, apigateway, autoscaling, cloudfront, cloudtrail, config, dynamodb, ec2, ecr, ecs, efs, eks, elasticache, elbv2, guardduty, iam, identitycenter, kms, lambda, logs, msk, opensearch, rds, redshift, s3, sagemaker, secretsmanager, securityhub, sns, sqs, wafv2`
 
-### Permissions
-
-Scan is best-effort: if some APIs are `AccessDenied`, scan continues for other services and prints an error summary.
-
-IAM (for users/groups/access keys) uses these APIs:
-
-- `iam:ListUsers`
-- `iam:ListAccessKeys`
-- `iam:GetAccessKeyLastUsed`
-- `iam:ListGroups`
-- `iam:ListGroupsForUser`
-- `iam:GenerateCredentialReport`
-- `iam:GetCredentialReport`
-
-Auto Scaling uses:
-
-- `autoscaling:DescribeAutoScalingGroups`
-- `autoscaling:DescribeAutoScalingInstances`
-- `autoscaling:DescribeLaunchConfigurations`
-
-SageMaker uses list/describe APIs for:
-
-- notebook instances, models, endpoint configs, endpoints
-- training jobs, processing jobs, transform jobs
-- domains and user profiles
-
-Identity Center uses:
-
-- `sso:ListInstances`
-- `sso:ListPermissionSets`
-- `sso:DescribePermissionSet`
-- `sso:ListAccountsForProvisionedPermissionSet`
-- `sso:ListAccountAssignments`
-- `identitystore:ListUsers`
-- `identitystore:ListGroups`
-- `identitystore:ListGroupMemberships`
-
-Note: Identity Center has a home region. Use `--regions all` (or include the home region explicitly) to discover Identity Center resources.
-
-CloudTrail uses:
-
-- `cloudtrail:DescribeTrails`
-- `cloudtrail:GetTrailStatus`
-- `cloudtrail:LookupEvents` (for Audit Events indexing)
-
-AWS Config uses:
-
-- `config:DescribeConfigurationRecorders`
-- `config:DescribeConfigurationRecorderStatus`
-- `config:DescribeDeliveryChannels`
-
-GuardDuty uses:
-
-- `guardduty:ListDetectors`
-- `guardduty:GetDetector`
-
-Security Hub uses:
-
-- `securityhub:DescribeHub`
-- `securityhub:GetEnabledStandards`
-
-IAM Access Analyzer uses:
-
-- `access-analyzer:ListAnalyzers`
-
-WAFv2 uses:
-
-- `wafv2:ListWebACLs`
-
-ACM uses:
-
-- `acm:ListCertificates`
-- `acm:DescribeCertificate`
-
-CloudFront uses:
-
-- `cloudfront:ListDistributions`
-
-API Gateway (REST) uses:
-
-- `apigateway:GET` (for `GetRestApis`)
-
-ECR uses:
-
-- `ecr:DescribeRepositories`
-
-EKS uses:
-
-- `eks:ListClusters`
-- `eks:DescribeCluster`
-
-ElastiCache uses:
-
-- `elasticache:DescribeReplicationGroups`
-- `elasticache:DescribeCacheClusters`
-
-OpenSearch uses:
-
-- `es:ListDomainNames`
-- `es:DescribeDomain`
-
-Redshift uses:
-
-- `redshift:DescribeClusters`
-
-MSK uses:
-
-- `kafka:ListClustersV2`
-
-EFS uses:
-
-- `elasticfilesystem:DescribeFileSystems`
-- `elasticfilesystem:DescribeMountTargets`
-- `elasticfilesystem:DescribeMountTargetSecurityGroups`
 
 ## TUI
 
@@ -383,6 +295,121 @@ Run tests:
 ```sh
 go test ./...
 ```
+
+### Permissions
+
+Scan is best-effort: if some APIs are `AccessDenied`, scan continues for other services and prints an error summary.
+
+IAM (for users/groups/access keys) uses these APIs:
+
+- `iam:ListUsers`
+- `iam:ListAccessKeys`
+- `iam:GetAccessKeyLastUsed`
+- `iam:ListGroups`
+- `iam:ListGroupsForUser`
+- `iam:GenerateCredentialReport`
+- `iam:GetCredentialReport`
+
+Auto Scaling uses:
+
+- `autoscaling:DescribeAutoScalingGroups`
+- `autoscaling:DescribeAutoScalingInstances`
+- `autoscaling:DescribeLaunchConfigurations`
+
+SageMaker uses list/describe APIs for:
+
+- notebook instances, models, endpoint configs, endpoints
+- training jobs, processing jobs, transform jobs
+- domains and user profiles
+
+Identity Center uses:
+
+- `sso:ListInstances`
+- `sso:ListPermissionSets`
+- `sso:DescribePermissionSet`
+- `sso:ListAccountsForProvisionedPermissionSet`
+- `sso:ListAccountAssignments`
+- `identitystore:ListUsers`
+- `identitystore:ListGroups`
+- `identitystore:ListGroupMemberships`
+
+Note: Identity Center has a home region. Use `--regions all` (or include the home region explicitly) to discover Identity Center resources.
+
+CloudTrail uses:
+
+- `cloudtrail:DescribeTrails`
+- `cloudtrail:GetTrailStatus`
+- `cloudtrail:LookupEvents` (for Audit Events indexing)
+
+AWS Config uses:
+
+- `config:DescribeConfigurationRecorders`
+- `config:DescribeConfigurationRecorderStatus`
+- `config:DescribeDeliveryChannels`
+
+GuardDuty uses:
+
+- `guardduty:ListDetectors`
+- `guardduty:GetDetector`
+
+Security Hub uses:
+
+- `securityhub:DescribeHub`
+- `securityhub:GetEnabledStandards`
+
+IAM Access Analyzer uses:
+
+- `access-analyzer:ListAnalyzers`
+
+WAFv2 uses:
+
+- `wafv2:ListWebACLs`
+
+ACM uses:
+
+- `acm:ListCertificates`
+- `acm:DescribeCertificate`
+
+CloudFront uses:
+
+- `cloudfront:ListDistributions`
+
+API Gateway (REST) uses:
+
+- `apigateway:GET` (for `GetRestApis`)
+
+ECR uses:
+
+- `ecr:DescribeRepositories`
+
+EKS uses:
+
+- `eks:ListClusters`
+- `eks:DescribeCluster`
+
+ElastiCache uses:
+
+- `elasticache:DescribeReplicationGroups`
+- `elasticache:DescribeCacheClusters`
+
+OpenSearch uses:
+
+- `es:ListDomainNames`
+- `es:DescribeDomain`
+
+Redshift uses:
+
+- `redshift:DescribeClusters`
+
+MSK uses:
+
+- `kafka:ListClustersV2`
+
+EFS uses:
+
+- `elasticfilesystem:DescribeFileSystems`
+- `elasticfilesystem:DescribeMountTargets`
+- `elasticfilesystem:DescribeMountTargetSecurityGroups`
 
 Architecture and contributor docs:
 
