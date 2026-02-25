@@ -10,14 +10,18 @@ import (
 )
 
 type App struct {
-	store  *store.Store
-	loader awsLoader
+	store              *store.Store
+	loader             awsLoader
+	listServiceCostAgg func(ctx context.Context, accountID string, regions []string) ([]store.CostAgg, error)
 }
 
 func New(st *store.Store) *App {
 	return &App{
 		store:  st,
 		loader: aws.NewLoader(),
+		listServiceCostAgg: func(ctx context.Context, accountID string, regions []string) ([]store.CostAgg, error) {
+			return st.ListServiceCostAggByRegions(ctx, accountID, regions)
+		},
 	}
 }
 
@@ -34,6 +38,29 @@ type ScanOptions struct {
 	ResolverConcurrency int
 }
 
+type ScanServiceCount struct {
+	Service   string
+	Resources int
+}
+
+type ScanRegionCount struct {
+	Region    string
+	Resources int
+	SharePct  float64
+}
+
+type ScanPricingSummary struct {
+	KnownUSD     float64
+	UnknownCount int
+	Currency     string
+}
+
+type ScanSummary struct {
+	ServiceCounts    []ScanServiceCount
+	ImportantRegions []ScanRegionCount
+	Pricing          ScanPricingSummary
+}
+
 type ScanResult struct {
 	Resources int
 	Edges     int
@@ -43,6 +70,8 @@ type ScanResult struct {
 	// StepFailures contains best-effort step errors (e.g. AccessDenied) encountered during scan.
 	// The scan still completes successfully when these are present.
 	StepFailures []ScanStepFailure
+
+	Summary ScanSummary
 }
 
 type ScanStepFailure struct {

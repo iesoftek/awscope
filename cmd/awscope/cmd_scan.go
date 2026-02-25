@@ -97,6 +97,7 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 
 			fmt.Printf("scan complete: account=%s partition=%s resources=%d edges=%d db=%s\n",
 				res.AccountID, res.Partition, res.Resources, res.Edges, st.DBPath())
+			fmt.Println(formatDetailedScanSummary(res))
 			if plain && len(res.StepFailures) > 0 {
 				fmt.Printf("errors (%d):\n", len(res.StepFailures))
 				for i, f := range res.StepFailures {

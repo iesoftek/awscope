@@ -1,6 +1,12 @@
 package main
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+
+	"awscope/internal/core"
+	"awscope/internal/cost"
+)
 
 func parseCSV(s string) []string {
 	var out []string
@@ -34,4 +40,60 @@ func sanitizeFilename(s string) string {
 		}
 	}
 	return strings.Trim(b.String(), "._-")
+}
+
+func formatDetailedScanSummary(res core.ScanResult) string {
+	var b strings.Builder
+	b.WriteString("summary:\n")
+
+	b.WriteString("  resources by service:\n")
+	if len(res.Summary.ServiceCounts) == 0 {
+		b.WriteString("    - none\n")
+	} else {
+		rows := res.Summary.ServiceCounts
+		extra := 0
+		if len(rows) > 12 {
+			extra = len(rows) - 12
+			rows = rows[:12]
+		}
+		width := 0
+		for _, r := range rows {
+			if len(r.Service) > width {
+				width = len(r.Service)
+			}
+		}
+		if width < 10 {
+			width = 10
+		}
+		for _, r := range rows {
+			fmt.Fprintf(&b, "    %-*s %6d\n", width, r.Service, r.Resources)
+		}
+		if extra > 0 {
+			fmt.Fprintf(&b, "    ... (+%d more)\n", extra)
+		}
+	}
+
+	b.WriteString("  important regions (top 5 by resource count):\n")
+	if len(res.Summary.ImportantRegions) == 0 {
+		b.WriteString("    - none\n")
+	} else {
+		width := 0
+		for _, r := range res.Summary.ImportantRegions {
+			if len(r.Region) > width {
+				width = len(r.Region)
+			}
+		}
+		if width < 10 {
+			width = 10
+		}
+		for _, r := range res.Summary.ImportantRegions {
+			fmt.Fprintf(&b, "    %-*s %6d (%.1f%%)\n", width, r.Region, r.Resources, r.SharePct)
+		}
+	}
+
+	b.WriteString("  estimated monthly pricing:\n")
+	fmt.Fprintf(&b, "    known total: %s\n", cost.FormatUSDPerMonthFull(res.Summary.Pricing.KnownUSD))
+	fmt.Fprintf(&b, "    unknown resources: %d", res.Summary.Pricing.UnknownCount)
+
+	return b.String()
 }

@@ -92,6 +92,8 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 	// Collect target groups discovered during scan so we can resolve instance membership later.
 	tgsByRegion := map[string][]string{}
 	var failures []ScanStepFailure
+	serviceCounts := map[string]int{}
+	regionCounts := map[string]int{}
 
 	stepSummary := func(providerID string, nodes []graph.ResourceNode, edges []graph.RelationshipEdge) (typeCounts map[string]int, sampleLabel string, sampleTotal int, sampleItems []string) {
 		typeCounts = map[string]int{}
@@ -212,6 +214,27 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 
 			atomic.AddInt64(&nodesSoFar, int64(len(r.res.Nodes)))
 			atomic.AddInt64(&edgesSoFar, int64(len(r.res.Edges)))
+
+			for _, n := range r.res.Nodes {
+				svc := strings.TrimSpace(n.Service)
+				if svc != "" {
+					serviceCounts[svc]++
+				}
+
+				region := ""
+				if _, _, rr, _, _, err := graph.ParseResourceKey(n.Key); err == nil {
+					region = strings.TrimSpace(rr)
+				}
+				if region == "" {
+					stepRegion := strings.TrimSpace(r.task.stepRegion)
+					if stepRegion != "" && stepRegion != "account" {
+						region = stepRegion
+					}
+				}
+				if region != "" {
+					regionCounts[region]++
+				}
+			}
 
 			// Aggregate TGs for resolver (region derived from node key; ScopeAccount can span regions).
 			if r.task.providerID == "elbv2" {
@@ -843,11 +866,122 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 		}
 	}
 
+	summary := ScanSummary{
+		Pricing: ScanPricingSummary{
+			Currency: "USD",
+		},
+	}
+
+	if len(serviceCounts) > 0 {
+		summary.ServiceCounts = make([]ScanServiceCount, 0, len(serviceCounts))
+		for service, count := range serviceCounts {
+			if strings.TrimSpace(service) == "" {
+				continue
+			}
+			summary.ServiceCounts = append(summary.ServiceCounts, ScanServiceCount{
+				Service:   service,
+				Resources: count,
+			})
+		}
+		sort.Slice(summary.ServiceCounts, func(i, j int) bool {
+			if summary.ServiceCounts[i].Resources != summary.ServiceCounts[j].Resources {
+				return summary.ServiceCounts[i].Resources > summary.ServiceCounts[j].Resources
+			}
+			return summary.ServiceCounts[i].Service < summary.ServiceCounts[j].Service
+		})
+	}
+
+	if len(regionCounts) > 0 {
+		type regionCount struct {
+			region string
+			count  int
+		}
+		hasNonGlobal := false
+		for region := range regionCounts {
+			if strings.TrimSpace(region) != "" && region != "global" {
+				hasNonGlobal = true
+				break
+			}
+		}
+		regionRows := make([]regionCount, 0, len(regionCounts))
+		for region, count := range regionCounts {
+			region = strings.TrimSpace(region)
+			if region == "" {
+				continue
+			}
+			if hasNonGlobal && region == "global" {
+				continue
+			}
+			regionRows = append(regionRows, regionCount{
+				region: region,
+				count:  count,
+			})
+		}
+		sort.Slice(regionRows, func(i, j int) bool {
+			if regionRows[i].count != regionRows[j].count {
+				return regionRows[i].count > regionRows[j].count
+			}
+			return regionRows[i].region < regionRows[j].region
+		})
+		if len(regionRows) > 5 {
+			regionRows = regionRows[:5]
+		}
+		totalResources := int(atomic.LoadInt64(&nodesSoFar))
+		summary.ImportantRegions = make([]ScanRegionCount, 0, len(regionRows))
+		for _, rr := range regionRows {
+			share := 0.0
+			if totalResources > 0 {
+				share = float64(rr.count) / float64(totalResources) * 100
+			}
+			summary.ImportantRegions = append(summary.ImportantRegions, ScanRegionCount{
+				Region:    rr.region,
+				Resources: rr.count,
+				SharePct:  share,
+			})
+		}
+	}
+
+	pricingRegions := make([]string, 0, len(opts.Regions)+1)
+	seenPricingRegion := map[string]struct{}{}
+	for _, region := range append(append([]string{}, opts.Regions...), "global") {
+		region = strings.TrimSpace(region)
+		if region == "" {
+			continue
+		}
+		if _, ok := seenPricingRegion[region]; ok {
+			continue
+		}
+		seenPricingRegion[region] = struct{}{}
+		pricingRegions = append(pricingRegions, region)
+	}
+	listCostAgg := a.listServiceCostAgg
+	if listCostAgg == nil {
+		listCostAgg = a.store.ListServiceCostAggByRegions
+	}
+	pricingRows, err := listCostAgg(ctx2, id.AccountID, pricingRegions)
+	if err != nil {
+		failures = append(failures, ScanStepFailure{
+			Phase:      PhaseCost,
+			ProviderID: "summary",
+			Region:     "all",
+			Error:      fmt.Sprintf("build pricing summary: %v", err),
+		})
+	} else {
+		for _, row := range pricingRows {
+			if _, ok := serviceCounts[row.Key]; !ok {
+				continue
+			}
+			summary.Pricing.KnownUSD += row.KnownUSD
+			summary.Pricing.UnknownCount += row.UnknownCount
+		}
+	}
+
 	return ScanResult{
 		Resources:    int(atomic.LoadInt64(&nodesSoFar)),
 		Edges:        int(atomic.LoadInt64(&edgesSoFar)),
 		AccountID:    id.AccountID,
 		Partition:    id.Partition,
 		StepFailures: failures,
+		Summary:      summary,
 	}, nil
 }
