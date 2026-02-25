@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"awscope/internal/actions"
 	actionsRegistry "awscope/internal/actions/registry"
@@ -10,8 +11,21 @@ import (
 	"awscope/internal/graph"
 	"awscope/internal/store"
 
+	awsSDK "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/google/uuid"
 )
+
+type RunActionOptions struct {
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
+}
+
+var loadActionIdentity = func(ctx context.Context, profileName, region string) (awsSDK.Config, aws.Identity, *aws.Loader, error) {
+	loader := aws.NewLoader()
+	cfg, id, err := loader.Load(ctx, profileName, region)
+	return cfg, id, loader, err
+}
 
 type ActionRunResult struct {
 	ActionID    string
@@ -19,7 +33,7 @@ type ActionRunResult struct {
 	Status      string
 }
 
-func RunAction(ctx context.Context, st *store.Store, actionID string, key graph.ResourceKey, profileName string) (ActionRunResult, error) {
+func RunAction(ctx context.Context, st *store.Store, actionID string, key graph.ResourceKey, profileName string, opts ...RunActionOptions) (ActionRunResult, error) {
 	a, ok := actionsRegistry.Get(actionID)
 	if !ok {
 		return ActionRunResult{}, fmt.Errorf("unknown action %q (known: %v)", actionID, actionsRegistry.ListIDs())
@@ -38,8 +52,7 @@ func RunAction(ctx context.Context, st *store.Store, actionID string, key graph.
 		return ActionRunResult{}, err
 	}
 
-	loader := aws.NewLoader()
-	cfg, id, err := loader.Load(ctx, profileName, region)
+	cfg, id, loader, err := loadActionIdentity(ctx, profileName, region)
 	if err != nil {
 		return ActionRunResult{}, err
 	}
@@ -48,6 +61,11 @@ func RunAction(ctx context.Context, st *store.Store, actionID string, key graph.
 	}
 	if accountID != "" && id.AccountID != "" && accountID != id.AccountID {
 		return ActionRunResult{}, fmt.Errorf("resource_key account %s does not match current identity account %s", accountID, id.AccountID)
+	}
+
+	var runOpts RunActionOptions
+	if len(opts) > 0 {
+		runOpts = opts[0]
 	}
 
 	runID := uuid.NewString()
@@ -61,7 +79,7 @@ func RunAction(ctx context.Context, st *store.Store, actionID string, key graph.
 		Input:       map[string]any{},
 	})
 
-	res, execErr := a.Execute(ctx, actions.ExecContext{
+	execCtx := actions.ExecContext{
 		Store:       st,
 		Loader:      loader,
 		AWSConfig:   cfg,
@@ -70,7 +88,18 @@ func RunAction(ctx context.Context, st *store.Store, actionID string, key graph.
 		Partition:   partition,
 		Region:      region,
 		ActionRunID: runID,
-	}, node)
+		Stdin:       runOpts.Stdin,
+		Stdout:      runOpts.Stdout,
+		Stderr:      runOpts.Stderr,
+	}
+
+	var res actions.Result
+	var execErr error
+	if ta, ok := a.(actions.TerminalAction); ok {
+		res, execErr = ta.ExecuteTerminal(ctx, execCtx, node)
+	} else {
+		res, execErr = a.Execute(ctx, execCtx, node)
+	}
 
 	status := "SUCCEEDED"
 	result := res.Data

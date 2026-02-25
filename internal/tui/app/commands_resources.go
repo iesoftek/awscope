@@ -1,6 +1,7 @@
 package app
 
 import (
+	"awscope/internal/actions"
 	actionsRegistry "awscope/internal/actions/registry"
 	"awscope/internal/core"
 	"awscope/internal/graph"
@@ -8,8 +9,10 @@ import (
 	"awscope/internal/tui/components/graphlens"
 	"awscope/internal/tui/widgets/table"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -499,6 +502,24 @@ func (m model) tryRunActionCmd() tea.Cmd {
 	m.err = nil
 	m.statusLine = ""
 
+	if a, ok := actionsRegistry.Get(actionID); ok {
+		if _, isTerminal := a.(actions.TerminalAction); isTerminal {
+			execCmd := &tuiActionExecCommand{
+				ctx:      m.ctx,
+				st:       m.st,
+				actionID: actionID,
+				key:      key,
+				profile:  profile,
+			}
+			return tea.Exec(execCmd, func(err error) tea.Msg {
+				if err != nil {
+					return actionDoneMsg{err: err}
+				}
+				return actionDoneMsg{line: execCmd.doneLine}
+			})
+		}
+	}
+
 	return func() tea.Msg {
 		res, err := core.RunAction(m.ctx, m.st, actionID, key, profile)
 		if err != nil {
@@ -506,6 +527,37 @@ func (m model) tryRunActionCmd() tea.Cmd {
 		}
 		return actionDoneMsg{line: fmt.Sprintf("action %s %s (%s)", res.ActionID, res.Status, res.ActionRunID)}
 	}
+}
+
+type tuiActionExecCommand struct {
+	ctx      context.Context
+	st       *store.Store
+	actionID string
+	key      graph.ResourceKey
+	profile  string
+
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
+
+	doneLine string
+}
+
+func (c *tuiActionExecCommand) SetStdin(r io.Reader)  { c.stdin = r }
+func (c *tuiActionExecCommand) SetStdout(w io.Writer) { c.stdout = w }
+func (c *tuiActionExecCommand) SetStderr(w io.Writer) { c.stderr = w }
+
+func (c *tuiActionExecCommand) Run() error {
+	res, err := core.RunAction(c.ctx, c.st, c.actionID, c.key, c.profile, core.RunActionOptions{
+		Stdin:  c.stdin,
+		Stdout: c.stdout,
+		Stderr: c.stderr,
+	})
+	if err != nil {
+		return err
+	}
+	c.doneLine = fmt.Sprintf("action %s %s (%s)", res.ActionID, res.Status, res.ActionRunID)
+	return nil
 }
 
 func (m model) loadRegionsCmd() tea.Cmd {

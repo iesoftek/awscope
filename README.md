@@ -225,6 +225,47 @@ Implemented v1.1 checks (mapped to AWS guidance families):
 - EKS: `EKS-001` (public API exposure)
 - EC2: `EC2-001/002` (public IP on running instance, world-open SG ingress)
 
+## Actions
+
+List available actions:
+
+```sh
+go run ./cmd/awscope action list
+```
+
+Run SSM shell action from CLI:
+
+```sh
+go run ./cmd/awscope action run --id ec2.ssm-shell --key <resource_key> --profile default --confirm
+```
+
+Run SSH via EC2 Instance Connect from CLI:
+
+```sh
+go run ./cmd/awscope action run --id ec2.ssh --key <resource_key> --profile default --confirm
+```
+
+Run SSM shell action from TUI:
+
+- select a running EC2 instance
+- press `A` (actions)
+- choose `Open SSM shell`
+- confirm by typing the resource ID and pressing enter
+
+When the interactive session exits, awscope regains terminal control automatically.
+
+Prerequisites for terminal EC2 actions:
+
+- AWS CLI v2 installed and available in `PATH`
+- `ec2.ssm-shell`: `session-manager-plugin` installed and available in `PATH`
+- `ec2.ssh`: OpenSSH client available in `PATH` and a public key at `~/.ssh/id_rsa.pub` (or `~/.ssh/id_ed25519.pub`)
+- IAM permissions to start SSM sessions (for example `ssm:StartSession` and related session channel permissions)
+- IAM permissions for EC2 Instance Connect (`ec2-instance-connect:SendSSHPublicKey`) and EC2 Instance Connect Endpoint/open-tunnel access as applicable
+
+Tip:
+
+- If `ec2.ssm-shell` returns `TargetNotConnected`, prefer `ec2.ssh` for instances reachable via EC2 Instance Connect.
+
 ## Export
 
 Export the latest inventory snapshot from SQLite:
