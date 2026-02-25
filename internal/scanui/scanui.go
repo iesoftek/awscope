@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"awscope/internal/core"
+	"awscope/internal/providers"
+	"awscope/internal/providers/registry"
 	"awscope/internal/store"
 
 	"github.com/charmbracelet/bubbles/progress"
@@ -43,6 +45,15 @@ type doneMsg struct {
 	err error
 }
 
+type stepState string
+
+const (
+	stepPending stepState = "pending"
+	stepRunning stepState = "running"
+	stepDone    stepState = "done"
+	stepError   stepState = "error"
+)
+
 type activeStep struct {
 	Key        string
 	Phase      core.ScanProgressPhase
@@ -51,6 +62,57 @@ type activeStep struct {
 	Message    string
 	StartedAt  time.Time
 	UpdatedAt  time.Time
+}
+
+type stepItem struct {
+	Key                string
+	Phase              core.ScanProgressPhase
+	ProviderID         string
+	Region             string
+	State              stepState
+	Message            string
+	StartedAt          time.Time
+	EndedAt            time.Time
+	StepResourcesAdded int
+	StepEdgesAdded     int
+	StepError          string
+	TypeCounts         map[string]int
+	SampleLabel        string
+	SampleTotal        int
+	SampleItems        []string
+}
+
+type checklistProviderGroup struct {
+	ProviderID string
+	Items      []*stepItem
+	Expected   int
+	Done       int
+	Errors     int
+	Running    int
+}
+
+type checklistGroup struct {
+	ID        string
+	Title     string
+	Phase     core.ScanProgressPhase
+	Providers []checklistProviderGroup
+	Expected  int
+	Done      int
+	Errors    int
+	Running   int
+}
+
+type collapsedSummary struct {
+	Steps     int
+	Resources int
+	Edges     int
+	Errors    int
+}
+
+type checklistRenderRow struct {
+	ID    string
+	Line  string
+	Level int
 }
 
 type model struct {
@@ -75,10 +137,18 @@ type model struct {
 	edgesSoFar  int
 	lastPrinted int
 
-	doneLines     []string
-	active        map[string]activeStep
-	activeOrder   []string
-	marqueeOffset int
+	doneLines      []string
+	active         map[string]activeStep
+	activeOrder    []string
+	marqueeOffset  int
+	checklistItems map[string]*stepItem
+	checklistOrder []string
+	groups         []checklistGroup
+	expectedKeys   map[string]struct{}
+	collapsed      map[string]bool
+	manualOverride map[string]bool
+	selectedRowID  string
+	rowOrder       []string
 
 	start time.Time
 	done  bool
@@ -135,14 +205,19 @@ func Run(ctx context.Context, st *store.Store, opts Options) (core.ScanResult, e
 	)
 
 	m := &model{
-		ctx:      ctx,
-		app:      app,
-		opts:     opts,
-		spin:     spin,
-		progress: p,
-		start:    time.Now(),
-		active:   map[string]activeStep{},
+		ctx:            ctx,
+		app:            app,
+		opts:           opts,
+		spin:           spin,
+		progress:       p,
+		start:          time.Now(),
+		active:         map[string]activeStep{},
+		checklistItems: map[string]*stepItem{},
+		expectedKeys:   map[string]struct{}{},
+		collapsed:      map[string]bool{},
+		manualOverride: map[string]bool{},
 	}
+	m.seedExpectedChecklist()
 
 	// Intentionally do not use AltScreen here: we use tea.Printf to show per-step lines,
 	// matching the Bubble Tea "package-manager" example style.
@@ -218,6 +293,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
+		case "down", "j":
+			m.moveSelection(+1)
+		case "up", "k":
+			m.moveSelection(-1)
+		case "enter", " ":
+			m.toggleSelectedCollapse()
 		case "q", "ctrl+c", "esc":
 			m.err = fmt.Errorf("scan cancelled")
 			return m, tea.Quit
@@ -330,27 +411,19 @@ func (m *model) View() string {
 	}
 	bottomLine := secondPrefix + lipgloss.NewStyle().MaxWidth(secondAvail).Render(roster)
 
-	// Render recent completed lines above the "sticky" progress line, package-manager style,
-	// but without tea.Printf to avoid interleaved output.
+	// Render checklist body above sticky progress lines.
 	stickyCount := 2
 	if m.height == 1 {
 		stickyCount = 1
 	}
-	var lines []string
-	if n := len(m.doneLines); n > 0 && m.height > 0 {
-		avail := m.height - stickyCount
-		if avail < 0 {
-			avail = 0
-		}
-		if avail > 0 {
-			if n > avail {
-				lines = append(lines, fmt.Sprintf("... (%d more)", n-avail))
-				lines = append(lines, m.doneLines[n-avail:]...)
-			} else {
-				lines = append(lines, m.doneLines...)
-			}
+	bodyAvail := 0
+	if m.height > 0 {
+		bodyAvail = m.height - stickyCount
+		if bodyAvail < 0 {
+			bodyAvail = 0
 		}
 	}
+	lines := m.renderChecklistBody(max(0, m.width), bodyAvail, time.Now())
 	lines = append(lines, topLine)
 	if stickyCount == 2 {
 		lines = append(lines, bottomLine)
@@ -374,18 +447,168 @@ func stepKey(ev core.ScanProgressEvent) string {
 	return strings.TrimSpace(fmt.Sprintf("%s|%s|%s", ev.Phase, ev.ProviderID, ev.Region))
 }
 
+func makeStepKey(phase core.ScanProgressPhase, providerID, region string) string {
+	return strings.TrimSpace(fmt.Sprintf("%s|%s|%s", phase, providerID, region))
+}
+
+func (m *model) seedExpectedChecklist() {
+	if m.checklistItems == nil {
+		m.checklistItems = map[string]*stepItem{}
+	}
+	if m.expectedKeys == nil {
+		m.expectedKeys = map[string]struct{}{}
+	}
+
+	add := func(phase core.ScanProgressPhase, providerID, region string) {
+		key := makeStepKey(phase, providerID, region)
+		if key == "" {
+			return
+		}
+		if _, ok := m.expectedKeys[key]; !ok {
+			m.expectedKeys[key] = struct{}{}
+		}
+		if _, ok := m.checklistItems[key]; ok {
+			return
+		}
+		m.checklistItems[key] = &stepItem{
+			Key:        key,
+			Phase:      phase,
+			ProviderID: strings.TrimSpace(providerID),
+			Region:     strings.TrimSpace(region),
+			State:      stepPending,
+		}
+		m.checklistOrder = append(m.checklistOrder, key)
+	}
+
+	auditRegions := make([]string, 0, len(m.opts.Regions))
+	regionSet := map[string]struct{}{}
+	for _, r := range m.opts.Regions {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			continue
+		}
+		regionSet[r] = struct{}{}
+		if !strings.EqualFold(r, "global") {
+			auditRegions = append(auditRegions, r)
+		}
+	}
+
+	needsResolver := hasProviderID(m.opts.ProviderIDs, "ec2") && hasProviderID(m.opts.ProviderIDs, "elbv2")
+	needsAudit := hasProviderID(m.opts.ProviderIDs, "cloudtrail") && len(auditRegions) > 0
+
+	for _, pid := range m.opts.ProviderIDs {
+		scope := providers.ScopeRegional
+		if p, ok := registry.Get(pid); ok {
+			scope = p.Scope()
+		}
+		switch scope {
+		case providers.ScopeGlobal:
+			add(core.PhaseProvider, pid, "global")
+		case providers.ScopeAccount:
+			add(core.PhaseProvider, pid, "account")
+		default:
+			for _, r := range m.opts.Regions {
+				add(core.PhaseProvider, pid, r)
+			}
+		}
+		add(core.PhaseCost, pid, "all")
+	}
+	if needsResolver {
+		for r := range regionSet {
+			add(core.PhaseResolver, "elbv2", r)
+		}
+	}
+	if needsAudit {
+		for _, r := range auditRegions {
+			add(core.PhaseAudit, "cloudtrail", r)
+		}
+	}
+}
+
 func (m *model) trackProgressEvent(ev core.ScanProgressEvent, now time.Time) {
 	if m.active == nil {
 		m.active = map[string]activeStep{}
+	}
+	if m.checklistItems == nil {
+		m.checklistItems = map[string]*stepItem{}
 	}
 	key := stepKey(ev)
 	if key == "" {
 		return
 	}
+	it, ok := m.checklistItems[key]
+	if !ok {
+		it = &stepItem{
+			Key:        key,
+			Phase:      ev.Phase,
+			ProviderID: strings.TrimSpace(ev.ProviderID),
+			Region:     strings.TrimSpace(ev.Region),
+			State:      stepPending,
+		}
+		m.checklistItems[key] = it
+		m.checklistOrder = append(m.checklistOrder, key)
+	}
+
 	if strings.TrimSpace(ev.Message) == "done" {
 		delete(m.active, key)
+		if strings.TrimSpace(ev.StepError) != "" {
+			it.State = stepError
+			it.StepError = strings.TrimSpace(ev.StepError)
+			m.clearCollapseOverrideForStep(it)
+		} else {
+			it.State = stepDone
+			it.StepError = ""
+		}
+		it.Message = strings.TrimSpace(ev.Message)
+		if it.StartedAt.IsZero() {
+			it.StartedAt = now
+		}
+		it.EndedAt = now
+		it.StepResourcesAdded = ev.StepResourcesAdded
+		it.StepEdgesAdded = ev.StepEdgesAdded
+		it.SampleLabel = ev.StepSampleLabel
+		it.SampleTotal = ev.StepSampleTotal
+		if len(ev.StepSampleItems) > 0 {
+			it.SampleItems = append([]string{}, ev.StepSampleItems...)
+		} else {
+			it.SampleItems = nil
+		}
+		if len(ev.StepTypeCounts) > 0 {
+			it.TypeCounts = map[string]int{}
+			for k, v := range ev.StepTypeCounts {
+				it.TypeCounts[k] = v
+			}
+		} else {
+			it.TypeCounts = nil
+		}
 		return
 	}
+
+	if it.State == stepPending {
+		it.State = stepRunning
+		if it.StartedAt.IsZero() {
+			it.StartedAt = now
+		}
+		m.clearCollapseOverrideForStep(it)
+	}
+	if it.State == stepDone || it.State == stepError {
+		it.State = stepRunning
+		m.clearCollapseOverrideForStep(it)
+	}
+	it.Message = strings.TrimSpace(ev.Message)
+	it.EndedAt = time.Time{}
+	if len(ev.StepTypeCounts) > 0 {
+		it.TypeCounts = map[string]int{}
+		for k, v := range ev.StepTypeCounts {
+			it.TypeCounts[k] = v
+		}
+	}
+	if ev.StepSampleLabel != "" {
+		it.SampleLabel = ev.StepSampleLabel
+		it.SampleTotal = ev.StepSampleTotal
+		it.SampleItems = append([]string{}, ev.StepSampleItems...)
+	}
+
 	if cur, ok := m.active[key]; ok {
 		cur.Message = ev.Message
 		cur.UpdatedAt = now
@@ -433,6 +656,568 @@ func (m *model) activePhaseCounts() (total, providers, resolvers, audits, costs 
 		}
 	}
 	return total, providers, resolvers, audits, costs
+}
+
+func (m *model) rebuildChecklistGroups() []checklistGroup {
+	phaseOrder := []core.ScanProgressPhase{
+		core.PhaseProvider,
+		core.PhaseResolver,
+		core.PhaseAudit,
+		core.PhaseCost,
+	}
+
+	groups := make([]checklistGroup, 0, len(phaseOrder))
+	for _, phase := range phaseOrder {
+		providersOrder := make([]string, 0)
+		providersMap := map[string]*checklistProviderGroup{}
+
+		for _, key := range m.checklistOrder {
+			it, ok := m.checklistItems[key]
+			if !ok || it == nil || it.Phase != phase {
+				continue
+			}
+			pid := strings.TrimSpace(it.ProviderID)
+			if pid == "" {
+				pid = "-"
+			}
+			pg, ok := providersMap[pid]
+			if !ok {
+				pg = &checklistProviderGroup{ProviderID: pid}
+				providersMap[pid] = pg
+				providersOrder = append(providersOrder, pid)
+			}
+			pg.Items = append(pg.Items, it)
+			if _, ok := m.expectedKeys[it.Key]; ok {
+				pg.Expected++
+			}
+			switch it.State {
+			case stepDone:
+				pg.Done++
+			case stepError:
+				pg.Errors++
+			case stepRunning:
+				pg.Running++
+			}
+		}
+
+		if len(providersOrder) == 0 {
+			continue
+		}
+
+		g := checklistGroup{
+			ID:    string(phase),
+			Title: string(phase),
+			Phase: phase,
+		}
+		for _, pid := range providersOrder {
+			pg := providersMap[pid]
+			if pg == nil {
+				continue
+			}
+			g.Providers = append(g.Providers, *pg)
+			g.Expected += pg.Expected
+			g.Done += pg.Done
+			g.Errors += pg.Errors
+			g.Running += pg.Running
+		}
+		groups = append(groups, g)
+	}
+	return groups
+}
+
+func (m *model) renderChecklistBody(width, height int, now time.Time) []string {
+	if height <= 0 || width <= 0 {
+		return nil
+	}
+	groups := m.rebuildChecklistGroups()
+	m.groups = groups
+	autoCollapsed := m.computeAutoCollapsed(groups)
+	effectiveCollapsed := m.effectiveCollapsed(autoCollapsed)
+	rows, collapsedCount := m.flattenRows(groups, effectiveCollapsed, now)
+	m.ensureSelectedRow()
+
+	totalExpected := 0
+	totalDone := 0
+	totalRunning := 0
+	totalErrors := 0
+	for _, g := range groups {
+		totalExpected += g.Expected
+		totalDone += g.Done
+		totalRunning += g.Running
+		totalErrors += g.Errors
+	}
+
+	lines := make([]string, 0, height+8)
+	header := fmt.Sprintf("%s done=%d/%d running=%d errors=%d collapsed=%d",
+		headerStyle.Render("Scan Tasks"), totalDone, totalExpected, totalRunning, totalErrors, collapsedCount)
+	lines = append(lines, lipgloss.NewStyle().MaxWidth(width).Render(header))
+
+	for _, row := range rows {
+		prefix := "  "
+		if row.ID != "" && row.ID == m.selectedRowID {
+			prefix = selectedMarkStyle.Render("› ")
+		}
+		lines = append(lines, lipgloss.NewStyle().MaxWidth(width).Render(prefix+row.Line))
+	}
+
+	if len(lines) <= height {
+		return lines
+	}
+	if height == 1 {
+		return []string{fmt.Sprintf("... (+%d more)", len(lines)-1)}
+	}
+	keep := height - 1
+	return append(lines[:keep], fmt.Sprintf("... (+%d more)", len(lines)-keep))
+}
+
+func phaseRowID(phase core.ScanProgressPhase) string {
+	return "phase|" + string(phase)
+}
+
+func providerRowID(phase core.ScanProgressPhase, providerID string) string {
+	return "provider|" + string(phase) + "|" + strings.TrimSpace(providerID)
+}
+
+func (m *model) providerAutoCollapsed(pg checklistProviderGroup) bool {
+	if pg.Running > 0 || pg.Errors > 0 || len(pg.Items) == 0 {
+		return false
+	}
+	for _, it := range pg.Items {
+		if it == nil || it.State != stepDone {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *model) computeAutoCollapsed(groups []checklistGroup) map[string]bool {
+	auto := map[string]bool{}
+	for _, g := range groups {
+		phaseKey := phaseRowID(g.Phase)
+		phaseCollapsed := len(g.Providers) > 0
+		if g.Running > 0 || g.Errors > 0 {
+			phaseCollapsed = false
+		}
+		for _, pg := range g.Providers {
+			pKey := providerRowID(g.Phase, pg.ProviderID)
+			pCollapsed := m.providerAutoCollapsed(pg)
+			auto[pKey] = pCollapsed
+			if !pCollapsed {
+				phaseCollapsed = false
+			}
+		}
+		auto[phaseKey] = phaseCollapsed
+	}
+	return auto
+}
+
+func (m *model) effectiveCollapsed(auto map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	for k, v := range auto {
+		out[k] = v
+	}
+	if m.manualOverride != nil {
+		for k, v := range m.manualOverride {
+			out[k] = v
+		}
+	}
+	if m.collapsed == nil {
+		m.collapsed = map[string]bool{}
+	}
+	m.collapsed = out
+	return out
+}
+
+func providerPendingCount(pg checklistProviderGroup) int {
+	n := 0
+	for _, it := range pg.Items {
+		if it != nil && it.State == stepPending {
+			n++
+		}
+	}
+	if n == 0 && pg.Expected > 0 {
+		left := pg.Expected - (pg.Done + pg.Running + pg.Errors)
+		if left > 0 {
+			n = left
+		}
+	}
+	return n
+}
+
+func orderProvidersByState(g checklistGroup, collapsed map[string]bool) []checklistProviderGroup {
+	activeExpanded := make([]checklistProviderGroup, 0, len(g.Providers))
+	pendingExpanded := make([]checklistProviderGroup, 0, len(g.Providers))
+	doneExpanded := make([]checklistProviderGroup, 0, len(g.Providers))
+	doneCollapsed := make([]checklistProviderGroup, 0, len(g.Providers))
+
+	for _, pg := range g.Providers {
+		pKey := providerRowID(g.Phase, pg.ProviderID)
+		if collapsed[pKey] {
+			doneCollapsed = append(doneCollapsed, pg)
+			continue
+		}
+		if pg.Running > 0 || pg.Errors > 0 {
+			activeExpanded = append(activeExpanded, pg)
+			continue
+		}
+		if providerPendingCount(pg) > 0 {
+			pendingExpanded = append(pendingExpanded, pg)
+			continue
+		}
+		doneExpanded = append(doneExpanded, pg)
+	}
+
+	ordered := make([]checklistProviderGroup, 0, len(g.Providers))
+	ordered = append(ordered, activeExpanded...)
+	ordered = append(ordered, pendingExpanded...)
+	ordered = append(ordered, doneExpanded...)
+	ordered = append(ordered, doneCollapsed...)
+	return ordered
+}
+
+func aggregateCollapsedProviderSummary(items []*stepItem) collapsedSummary {
+	sum := collapsedSummary{Steps: len(items)}
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		sum.Resources += it.StepResourcesAdded
+		sum.Edges += it.StepEdgesAdded
+		if it.State == stepError {
+			sum.Errors++
+		}
+	}
+	return sum
+}
+
+type providerBuckets struct {
+	running []*stepItem
+	errors  []*stepItem
+	pending []*stepItem
+	done    []*stepItem
+}
+
+func splitProviderItems(items []*stepItem) providerBuckets {
+	out := providerBuckets{
+		running: make([]*stepItem, 0, len(items)),
+		errors:  make([]*stepItem, 0, len(items)),
+		pending: make([]*stepItem, 0, len(items)),
+		done:    make([]*stepItem, 0, len(items)),
+	}
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		switch it.State {
+		case stepRunning:
+			out.running = append(out.running, it)
+		case stepError:
+			out.errors = append(out.errors, it)
+		case stepDone:
+			out.done = append(out.done, it)
+		default:
+			out.pending = append(out.pending, it)
+		}
+	}
+	return out
+}
+
+func summarizeRegions(items []*stepItem, limit int) string {
+	if len(items) == 0 {
+		return "-"
+	}
+	if limit <= 0 {
+		limit = 3
+	}
+	regions := make([]string, 0, len(items))
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		r := strings.TrimSpace(it.Region)
+		if r == "" {
+			r = "-"
+		}
+		regions = append(regions, r)
+	}
+	if len(regions) == 0 {
+		return "-"
+	}
+	sort.Strings(regions)
+	if len(regions) <= limit {
+		return strings.Join(regions, ", ")
+	}
+	return fmt.Sprintf("%s (+%d more)", strings.Join(regions[:limit], ", "), len(regions)-limit)
+}
+
+func summarizeDoneTotals(items []*stepItem) (res int, edges int) {
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		res += it.StepResourcesAdded
+		edges += it.StepEdgesAdded
+	}
+	return res, edges
+}
+
+func renderStepLine(it *stepItem, now time.Time, spinGlyph string) string {
+	if it == nil {
+		return ""
+	}
+	meta := ""
+	switch it.State {
+	case stepRunning:
+		elapsed := now.Sub(it.StartedAt)
+		if it.StartedAt.IsZero() || elapsed < 0 {
+			elapsed = 0
+		}
+		meta = fmt.Sprintf("%s | %s", formatStepElapsed(elapsed), trimOneLine(it.Message, 48))
+	case stepDone:
+		meta = fmt.Sprintf("+res=%d +edges=%d", it.StepResourcesAdded, it.StepEdgesAdded)
+	case stepError:
+		meta = trimOneLine(it.StepError, 64)
+	default:
+		meta = trimOneLine(it.Message, 48)
+	}
+	region := strings.TrimSpace(it.Region)
+	if region == "" {
+		region = "-"
+	}
+	return fmt.Sprintf("    %s %s  %s", stepStateMark(it.State, spinGlyph), fitCell(region, 14), meta)
+}
+
+func (m *model) flattenRows(groups []checklistGroup, collapsed map[string]bool, now time.Time) ([]checklistRenderRow, int) {
+	rows := make([]checklistRenderRow, 0, 256)
+	rowOrder := make([]string, 0, 64)
+	collapsedCount := 0
+	spinGlyph := m.spin.View()
+
+	for _, g := range groups {
+		phaseKey := phaseRowID(g.Phase)
+		phaseCollapsed := collapsed[phaseKey]
+		if phaseCollapsed {
+			collapsedCount++
+		}
+		phaseTwisty := "▾"
+		if phaseCollapsed {
+			phaseTwisty = "▸"
+		}
+		gLine := fmt.Sprintf("%s %s %s [%d/%d] (running=%d error=%d)",
+			phaseTwisty,
+			stepStateMark(aggregateState(g.Done, g.Expected, g.Running, g.Errors), spinGlyph),
+			phaseStyle(g.Phase).Render(g.Title),
+			g.Done, g.Expected, g.Running, g.Errors)
+		rows = append(rows, checklistRenderRow{ID: phaseKey, Line: gLine, Level: 0})
+		rowOrder = append(rowOrder, phaseKey)
+		if phaseCollapsed {
+			continue
+		}
+
+		for _, pg := range orderProvidersByState(g, collapsed) {
+			pKey := providerRowID(g.Phase, pg.ProviderID)
+			pCollapsed := collapsed[pKey]
+			if pCollapsed {
+				collapsedCount++
+			}
+			pTwisty := "▾"
+			if pCollapsed {
+				pTwisty = "▸"
+			}
+			pState := aggregateState(pg.Done, pg.Expected, pg.Running, pg.Errors)
+			pLine := fmt.Sprintf("  %s %s %s [%d/%d]",
+				pTwisty,
+				stepStateMark(pState, spinGlyph),
+				phaseStyle(g.Phase).Render(pg.ProviderID),
+				pg.Done, pg.Expected)
+			if pCollapsed {
+				sum := aggregateCollapsedProviderSummary(pg.Items)
+				pLine += fmt.Sprintf(" (%d steps, +res=%d, +edges=%d)", sum.Steps, sum.Resources, sum.Edges)
+			}
+			rows = append(rows, checklistRenderRow{ID: pKey, Line: pLine, Level: 1})
+			rowOrder = append(rowOrder, pKey)
+			if pCollapsed {
+				continue
+			}
+			buckets := splitProviderItems(pg.Items)
+
+			for _, it := range buckets.errors {
+				rows = append(rows, checklistRenderRow{Line: renderStepLine(it, now, spinGlyph), Level: 2})
+			}
+			for _, it := range buckets.running {
+				rows = append(rows, checklistRenderRow{Line: renderStepLine(it, now, spinGlyph), Level: 2})
+				extra := formatStepExtraInline(it)
+				if extra != "" {
+					rows = append(rows, checklistRenderRow{Line: "      " + trimOneLine(extra, 120), Level: 3})
+				}
+			}
+
+			if len(buckets.pending) > 0 {
+				pendingLine := fmt.Sprintf("    %s pending regions=%d | %s",
+					stepStateMark(stepPending, spinGlyph),
+					len(buckets.pending),
+					summarizeRegions(buckets.pending, 4),
+				)
+				rows = append(rows, checklistRenderRow{Line: pendingLine, Level: 2})
+			}
+
+			if len(buckets.done) > 0 {
+				doneRes, doneEdges := summarizeDoneTotals(buckets.done)
+				doneLine := fmt.Sprintf("    %s done regions=%d +res=%d +edges=%d | %s",
+					stepStateMark(stepDone, spinGlyph),
+					len(buckets.done),
+					doneRes,
+					doneEdges,
+					summarizeRegions(buckets.done, 4),
+				)
+				rows = append(rows, checklistRenderRow{Line: doneLine, Level: 2})
+			}
+		}
+	}
+
+	m.rowOrder = rowOrder
+	return rows, collapsedCount
+}
+
+func (m *model) ensureSelectedRow() {
+	if len(m.rowOrder) == 0 {
+		m.selectedRowID = ""
+		return
+	}
+	if m.selectedRowID == "" {
+		m.selectedRowID = m.rowOrder[0]
+		return
+	}
+	for _, id := range m.rowOrder {
+		if id == m.selectedRowID {
+			return
+		}
+	}
+	m.selectedRowID = m.rowOrder[0]
+}
+
+func (m *model) moveSelection(delta int) {
+	if len(m.rowOrder) == 0 || delta == 0 {
+		return
+	}
+	m.ensureSelectedRow()
+	idx := 0
+	for i, id := range m.rowOrder {
+		if id == m.selectedRowID {
+			idx = i
+			break
+		}
+	}
+	next := idx + delta
+	if next < 0 {
+		next = 0
+	}
+	if next >= len(m.rowOrder) {
+		next = len(m.rowOrder) - 1
+	}
+	m.selectedRowID = m.rowOrder[next]
+}
+
+func (m *model) toggleSelectedCollapse() {
+	if m.selectedRowID == "" {
+		return
+	}
+	if m.manualOverride == nil {
+		m.manualOverride = map[string]bool{}
+	}
+	cur := false
+	if m.collapsed != nil {
+		cur = m.collapsed[m.selectedRowID]
+	}
+	m.manualOverride[m.selectedRowID] = !cur
+	if m.collapsed == nil {
+		m.collapsed = map[string]bool{}
+	}
+	m.collapsed[m.selectedRowID] = !cur
+}
+
+func (m *model) clearCollapseOverrideForStep(it *stepItem) {
+	if it == nil {
+		return
+	}
+	pKey := providerRowID(it.Phase, it.ProviderID)
+	phKey := phaseRowID(it.Phase)
+	if m.manualOverride != nil {
+		delete(m.manualOverride, pKey)
+		delete(m.manualOverride, phKey)
+	}
+	if m.collapsed != nil {
+		m.collapsed[pKey] = false
+		m.collapsed[phKey] = false
+	}
+}
+
+func aggregateState(done, expected, running, errors int) stepState {
+	if errors > 0 {
+		return stepError
+	}
+	if running > 0 {
+		return stepRunning
+	}
+	if expected > 0 && done >= expected {
+		return stepDone
+	}
+	return stepPending
+}
+
+func stepStateMark(state stepState, spinGlyph string) string {
+	switch state {
+	case stepDone:
+		return checkMark.String()
+	case stepError:
+		return crossMark.String()
+	case stepRunning:
+		g := strings.TrimSpace(spinGlyph)
+		if g == "" {
+			g = "…"
+		}
+		return runningMarkStyle.Render(g)
+	default:
+		return pendingMarkStyle.Render("◌")
+	}
+}
+
+func formatStepExtraInline(it *stepItem) string {
+	if it == nil {
+		return ""
+	}
+	if len(it.TypeCounts) > 0 {
+		type kv struct {
+			k string
+			v int
+		}
+		xs := make([]kv, 0, len(it.TypeCounts))
+		for k, v := range it.TypeCounts {
+			xs = append(xs, kv{k: k, v: v})
+		}
+		sort.Slice(xs, func(i, j int) bool {
+			if xs[i].v != xs[j].v {
+				return xs[i].v > xs[j].v
+			}
+			return xs[i].k < xs[j].k
+		})
+		limit := 3
+		if len(xs) < limit {
+			limit = len(xs)
+		}
+		parts := make([]string, 0, limit)
+		for i := 0; i < limit; i++ {
+			parts = append(parts, fmt.Sprintf("%s=%d", xs[i].k, xs[i].v))
+		}
+		return "types: " + strings.Join(parts, " ")
+	}
+	if it.SampleLabel != "" && it.SampleTotal > 0 {
+		if len(it.SampleItems) == 0 {
+			return fmt.Sprintf("sample: %s=%d", it.SampleLabel, it.SampleTotal)
+		}
+		return fmt.Sprintf("sample: %s=%d: %s", it.SampleLabel, it.SampleTotal, strings.Join(it.SampleItems, ", "))
+	}
+	return ""
 }
 
 func (m *model) renderActiveRoster(width int, now time.Time) string {
@@ -757,6 +1542,8 @@ var (
 	doneStyle          = lipgloss.NewStyle().Margin(1, 2)
 	checkMark          = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).SetString("✓")
 	crossMark          = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).SetString("✗")
+	runningMarkStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	pendingMarkStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	headerStyle        = lipgloss.NewStyle().Bold(true)
 	phaseProviderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
 	phaseResolverStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
@@ -765,7 +1552,21 @@ var (
 	activeDefaultStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
 	activeElapsedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 	activeMoreStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
+	selectedMarkStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("221")).Bold(true)
 )
+
+func hasProviderID(ids []string, needle string) bool {
+	needle = strings.TrimSpace(strings.ToLower(needle))
+	if needle == "" {
+		return false
+	}
+	for _, id := range ids {
+		if strings.TrimSpace(strings.ToLower(id)) == needle {
+			return true
+		}
+	}
+	return false
+}
 
 func max(a, b int) int {
 	if a > b {

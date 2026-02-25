@@ -121,4 +121,10 @@ func TestNewScanCmd_DefaultFlagsAndNoCloudTrail(t *testing.T) {
 	if got := cmd.Flags().Lookup("cost-concurrency").DefValue; got != "16" {
 		t.Fatalf("cost default: got %q want %q", got, "16")
 	}
+	if f := cmd.Flags().Lookup("aws-max-attempts"); f == nil {
+		t.Fatalf("expected --aws-max-attempts flag")
+	}
+	if f := cmd.Flags().Lookup("aws-retry-mode"); f == nil {
+		t.Fatalf("expected --aws-retry-mode flag")
+	}
 }

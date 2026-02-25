@@ -1,16 +1,34 @@
 package scanui
 
 import (
+	"context"
+	"fmt"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"awscope/internal/core"
+	"awscope/internal/providers"
+	"awscope/internal/providers/registry"
+
+	awsSDK "github.com/aws/aws-sdk-go-v2/aws"
 
 	"github.com/charmbracelet/bubbles/progress"
 	"github.com/charmbracelet/bubbles/spinner"
 )
+
+type testScopeProvider struct {
+	id    string
+	scope providers.ScopeKind
+}
+
+func (p testScopeProvider) ID() string                 { return p.id }
+func (p testScopeProvider) DisplayName() string        { return p.id }
+func (p testScopeProvider) Scope() providers.ScopeKind { return p.scope }
+func (p testScopeProvider) List(context.Context, awsSDK.Config, providers.ListRequest) (providers.ListResult, error) {
+	return providers.ListResult{}, nil
+}
 
 func TestTrackProgressEventLifecycle(t *testing.T) {
 	m := &model{active: map[string]activeStep{}}
@@ -145,6 +163,440 @@ func TestViewAnchorsProgressLineAtBottom(t *testing.T) {
 	}
 	if !strings.Contains(stripANSI(lines[len(lines)-1]), "active:") {
 		t.Fatalf("last line is not active roster line: %q", lines[len(lines)-1])
+	}
+}
+
+func TestSeedExpectedChecklistIncludesAllPhases(t *testing.T) {
+	pidRegional := fmt.Sprintf("scanui-regional-%d", time.Now().UnixNano())
+	pidGlobal := fmt.Sprintf("scanui-global-%d", time.Now().UnixNano())
+	pidAccount := fmt.Sprintf("scanui-account-%d", time.Now().UnixNano())
+	pidCloudTrail := fmt.Sprintf("scanui-cloudtrail-%d", time.Now().UnixNano())
+	registry.Register(testScopeProvider{id: pidRegional, scope: providers.ScopeRegional})
+	registry.Register(testScopeProvider{id: pidGlobal, scope: providers.ScopeGlobal})
+	registry.Register(testScopeProvider{id: pidAccount, scope: providers.ScopeAccount})
+	registry.Register(testScopeProvider{id: pidCloudTrail, scope: providers.ScopeRegional})
+
+	m := &model{
+		opts: Options{
+			ProviderIDs: []string{pidRegional, pidGlobal, pidAccount, pidCloudTrail, "ec2", "elbv2", "cloudtrail"},
+			Regions:     []string{"us-east-1", "us-west-2"},
+		},
+		checklistItems: map[string]*stepItem{},
+		expectedKeys:   map[string]struct{}{},
+	}
+	m.seedExpectedChecklist()
+	if len(m.checklistOrder) == 0 {
+		t.Fatalf("expected preseeded checklist items")
+	}
+	// provider
+	requireChecklistKey(t, m, "provider|"+pidRegional+"|us-east-1")
+	requireChecklistKey(t, m, "provider|"+pidGlobal+"|global")
+	requireChecklistKey(t, m, "provider|"+pidAccount+"|account")
+	// resolver (ec2+elbv2)
+	requireChecklistKey(t, m, "resolver|elbv2|us-east-1")
+	// audit (cloudtrail + non-global regions)
+	requireChecklistKey(t, m, "audit|cloudtrail|us-west-2")
+	// cost
+	requireChecklistKey(t, m, "cost|"+pidRegional+"|all")
+}
+
+func TestTrackProgressEventUpdatesChecklistState(t *testing.T) {
+	m := &model{
+		active:         map[string]activeStep{},
+		checklistItems: map[string]*stepItem{},
+	}
+	t0 := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC)
+	evStart := core.ScanProgressEvent{
+		Phase:      core.PhaseProvider,
+		ProviderID: "ec2",
+		Region:     "us-east-1",
+		Message:    "listing",
+	}
+	m.trackProgressEvent(evStart, t0)
+	k := stepKey(evStart)
+	it := m.checklistItems[k]
+	if it == nil || it.State != stepRunning {
+		t.Fatalf("expected running checklist state, got %#v", it)
+	}
+
+	evDone := evStart
+	evDone.Message = "done"
+	evDone.StepResourcesAdded = 10
+	evDone.StepEdgesAdded = 8
+	m.trackProgressEvent(evDone, t0.Add(3*time.Second))
+	it = m.checklistItems[k]
+	if it == nil || it.State != stepDone {
+		t.Fatalf("expected done checklist state, got %#v", it)
+	}
+	if it.StepResourcesAdded != 10 || it.StepEdgesAdded != 8 {
+		t.Fatalf("unexpected counters: %#v", it)
+	}
+
+	evErr := core.ScanProgressEvent{
+		Phase:      core.PhaseAudit,
+		ProviderID: "cloudtrail",
+		Region:     "us-east-1",
+		Message:    "done",
+		StepError:  "rate exceeded",
+	}
+	m.trackProgressEvent(evErr, t0.Add(4*time.Second))
+	ek := stepKey(evErr)
+	eit := m.checklistItems[ek]
+	if eit == nil || eit.State != stepError {
+		t.Fatalf("expected error checklist state, got %#v", eit)
+	}
+}
+
+func TestRenderChecklistBodyTruncates(t *testing.T) {
+	m := &model{
+		width:          120,
+		checklistItems: map[string]*stepItem{},
+		expectedKeys:   map[string]struct{}{},
+	}
+	now := time.Date(2026, 2, 25, 10, 0, 0, 0, time.UTC)
+	// populate enough rows to force truncation
+	for i := 0; i < 8; i++ {
+		region := fmt.Sprintf("us-east-%d", i+1)
+		key := makeStepKey(core.PhaseProvider, "ec2", region)
+		m.checklistItems[key] = &stepItem{
+			Key:        key,
+			Phase:      core.PhaseProvider,
+			ProviderID: "ec2",
+			Region:     region,
+			State:      stepRunning,
+			StartedAt:  now.Add(-10 * time.Second),
+			Message:    "listing",
+		}
+		m.checklistOrder = append(m.checklistOrder, key)
+		m.expectedKeys[key] = struct{}{}
+	}
+	lines := m.renderChecklistBody(80, 4, now)
+	if len(lines) != 4 {
+		t.Fatalf("expected height-limited lines, got %d", len(lines))
+	}
+	if !strings.Contains(stripANSI(lines[len(lines)-1]), "(+") {
+		t.Fatalf("expected truncation marker, got %q", lines[len(lines)-1])
+	}
+}
+
+func TestAutoCollapseDoneProvider(t *testing.T) {
+	m := &model{
+		checklistItems: map[string]*stepItem{},
+		expectedKeys:   map[string]struct{}{},
+	}
+	k := makeStepKey(core.PhaseProvider, "ec2", "us-east-1")
+	m.checklistItems[k] = &stepItem{
+		Key:        k,
+		Phase:      core.PhaseProvider,
+		ProviderID: "ec2",
+		Region:     "us-east-1",
+		State:      stepDone,
+	}
+	m.checklistOrder = append(m.checklistOrder, k)
+	m.expectedKeys[k] = struct{}{}
+
+	groups := m.rebuildChecklistGroups()
+	auto := m.computeAutoCollapsed(groups)
+	if !auto[providerRowID(core.PhaseProvider, "ec2")] {
+		t.Fatalf("expected provider to auto-collapse when fully done")
+	}
+	if !auto[phaseRowID(core.PhaseProvider)] {
+		t.Fatalf("expected phase to auto-collapse when all children are done")
+	}
+}
+
+func TestAutoExpandOnRunningOrError(t *testing.T) {
+	m := &model{
+		active:         map[string]activeStep{},
+		checklistItems: map[string]*stepItem{},
+		collapsed:      map[string]bool{},
+		manualOverride: map[string]bool{},
+	}
+	pid := "ec2"
+	pKey := providerRowID(core.PhaseProvider, pid)
+	phKey := phaseRowID(core.PhaseProvider)
+	m.manualOverride[pKey] = true
+	m.manualOverride[phKey] = true
+	m.collapsed[pKey] = true
+	m.collapsed[phKey] = true
+
+	ev := core.ScanProgressEvent{
+		Phase:      core.PhaseProvider,
+		ProviderID: pid,
+		Region:     "us-east-1",
+		Message:    "listing",
+	}
+	m.trackProgressEvent(ev, time.Now())
+	if _, ok := m.manualOverride[pKey]; ok {
+		t.Fatalf("provider manual override should clear on running event")
+	}
+	if _, ok := m.manualOverride[phKey]; ok {
+		t.Fatalf("phase manual override should clear on running event")
+	}
+	if m.collapsed[pKey] {
+		t.Fatalf("provider should be forced expanded on running event")
+	}
+}
+
+func TestBalancedOrderingPrioritizesActiveProviders(t *testing.T) {
+	m := &model{
+		checklistItems: map[string]*stepItem{},
+		expectedKeys:   map[string]struct{}{},
+		collapsed:      map[string]bool{},
+		manualOverride: map[string]bool{},
+	}
+	runningKey := makeStepKey(core.PhaseProvider, "ecs", "us-west-2")
+	doneKey := makeStepKey(core.PhaseProvider, "ec2", "us-east-1")
+	m.checklistItems[runningKey] = &stepItem{
+		Key:        runningKey,
+		Phase:      core.PhaseProvider,
+		ProviderID: "ecs",
+		Region:     "us-west-2",
+		State:      stepRunning,
+		StartedAt:  time.Now().Add(-5 * time.Second),
+		Message:    "listing",
+	}
+	m.checklistItems[doneKey] = &stepItem{
+		Key:                doneKey,
+		Phase:              core.PhaseProvider,
+		ProviderID:         "ec2",
+		Region:             "us-east-1",
+		State:              stepDone,
+		StepResourcesAdded: 4,
+		StepEdgesAdded:     2,
+	}
+	m.checklistOrder = append(m.checklistOrder, runningKey, doneKey)
+	m.expectedKeys[runningKey] = struct{}{}
+	m.expectedKeys[doneKey] = struct{}{}
+
+	lines := m.renderChecklistBody(140, 20, time.Now())
+	plain := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		plain = append(plain, stripANSI(ln))
+	}
+	ecsIdx := -1
+	ec2Idx := -1
+	for i, ln := range plain {
+		if strings.Contains(ln, " ecs [") {
+			ecsIdx = i
+		}
+		if strings.Contains(ln, " ec2 [") {
+			ec2Idx = i
+		}
+	}
+	if ecsIdx == -1 || ec2Idx == -1 {
+		t.Fatalf("expected provider rows for ecs and ec2, got:\n%s", strings.Join(plain, "\n"))
+	}
+	if ecsIdx >= ec2Idx {
+		t.Fatalf("expected active provider before done-collapsed provider, ecs=%d ec2=%d", ecsIdx, ec2Idx)
+	}
+}
+
+func TestManualTogglePersistsUntilSafetyOverride(t *testing.T) {
+	now := time.Now()
+	m := &model{
+		active:         map[string]activeStep{},
+		checklistItems: map[string]*stepItem{},
+		expectedKeys:   map[string]struct{}{},
+		collapsed:      map[string]bool{},
+		manualOverride: map[string]bool{},
+	}
+	k := makeStepKey(core.PhaseProvider, "ec2", "us-east-1")
+	m.checklistItems[k] = &stepItem{
+		Key:        k,
+		Phase:      core.PhaseProvider,
+		ProviderID: "ec2",
+		Region:     "us-east-1",
+		State:      stepDone,
+		StartedAt:  now.Add(-2 * time.Second),
+		EndedAt:    now,
+	}
+	m.checklistOrder = append(m.checklistOrder, k)
+	m.expectedKeys[k] = struct{}{}
+
+	_ = m.renderChecklistBody(140, 20, now)
+	m.manualOverride[phaseRowID(core.PhaseProvider)] = false
+	_ = m.renderChecklistBody(140, 20, now)
+	m.selectedRowID = providerRowID(core.PhaseProvider, "ec2")
+	initial := m.collapsed[m.selectedRowID]
+	m.toggleSelectedCollapse()
+	if v, ok := m.manualOverride[m.selectedRowID]; !ok || v != !initial {
+		t.Fatalf("expected first toggle to invert collapsed state, initial=%v override=%v ok=%v", initial, v, ok)
+	}
+
+	// toggle back
+	m.toggleSelectedCollapse()
+	if v, ok := m.manualOverride[m.selectedRowID]; !ok || v != initial {
+		t.Fatalf("expected second toggle to restore collapsed state, initial=%v override=%v ok=%v", initial, v, ok)
+	}
+
+	// running event should clear manual override for safety
+	ev := core.ScanProgressEvent{
+		Phase:      core.PhaseProvider,
+		ProviderID: "ec2",
+		Region:     "us-east-1",
+		Message:    "listing",
+	}
+	m.trackProgressEvent(ev, now.Add(3*time.Second))
+	if _, ok := m.manualOverride[m.selectedRowID]; ok {
+		t.Fatalf("expected manual override cleared on running event")
+	}
+}
+
+func TestSelectionNavigationAcrossVisibleRows(t *testing.T) {
+	now := time.Now()
+	m := &model{
+		checklistItems: map[string]*stepItem{},
+		expectedKeys:   map[string]struct{}{},
+		collapsed:      map[string]bool{},
+		manualOverride: map[string]bool{},
+	}
+	keys := []string{
+		makeStepKey(core.PhaseProvider, "ec2", "us-east-1"),
+		makeStepKey(core.PhaseProvider, "ecs", "us-west-2"),
+	}
+	for _, k := range keys {
+		pid := strings.Split(k, "|")[1]
+		region := strings.Split(k, "|")[2]
+		m.checklistItems[k] = &stepItem{
+			Key:        k,
+			Phase:      core.PhaseProvider,
+			ProviderID: pid,
+			Region:     region,
+			State:      stepPending,
+		}
+		m.checklistOrder = append(m.checklistOrder, k)
+		m.expectedKeys[k] = struct{}{}
+	}
+	_ = m.renderChecklistBody(140, 20, now)
+	if len(m.rowOrder) == 0 {
+		t.Fatalf("expected non-empty row order")
+	}
+	first := m.selectedRowID
+	m.moveSelection(+1)
+	if m.selectedRowID == first {
+		t.Fatalf("expected selection to move forward")
+	}
+	second := m.selectedRowID
+	m.moveSelection(-1)
+	if m.selectedRowID != first {
+		t.Fatalf("expected selection to move back to first row")
+	}
+	m.moveSelection(+100)
+	if m.selectedRowID == second && len(m.rowOrder) > 2 {
+		t.Fatalf("expected selection clamped at last visible row")
+	}
+}
+
+func TestCollapsedProviderSummaryRendering(t *testing.T) {
+	now := time.Now()
+	m := &model{
+		checklistItems: map[string]*stepItem{},
+		expectedKeys:   map[string]struct{}{},
+		collapsed:      map[string]bool{},
+		manualOverride: map[string]bool{},
+	}
+	k1 := makeStepKey(core.PhaseProvider, "ec2", "us-east-1")
+	k2 := makeStepKey(core.PhaseProvider, "ec2", "us-west-2")
+	m.checklistItems[k1] = &stepItem{
+		Key:                k1,
+		Phase:              core.PhaseProvider,
+		ProviderID:         "ec2",
+		Region:             "us-east-1",
+		State:              stepDone,
+		StepResourcesAdded: 10,
+		StepEdgesAdded:     8,
+	}
+	m.checklistItems[k2] = &stepItem{
+		Key:                k2,
+		Phase:              core.PhaseProvider,
+		ProviderID:         "ec2",
+		Region:             "us-west-2",
+		State:              stepDone,
+		StepResourcesAdded: 5,
+		StepEdgesAdded:     4,
+	}
+	m.checklistOrder = append(m.checklistOrder, k1, k2)
+	m.expectedKeys[k1] = struct{}{}
+	m.expectedKeys[k2] = struct{}{}
+
+	m.manualOverride[phaseRowID(core.PhaseProvider)] = false
+	lines := m.renderChecklistBody(160, 20, now)
+	joined := stripANSI(strings.Join(lines, "\n"))
+	if !strings.Contains(joined, "(2 steps, +res=15, +edges=12)") {
+		t.Fatalf("expected collapsed provider summary, got:\n%s", joined)
+	}
+}
+
+func TestExpandedProviderUsesCompactRegionSummaries(t *testing.T) {
+	now := time.Now()
+	m := &model{
+		checklistItems: map[string]*stepItem{},
+		expectedKeys:   map[string]struct{}{},
+		collapsed:      map[string]bool{},
+		manualOverride: map[string]bool{},
+	}
+	kRun := makeStepKey(core.PhaseProvider, "ecs", "us-east-1")
+	kDone1 := makeStepKey(core.PhaseProvider, "ecs", "us-west-2")
+	kDone2 := makeStepKey(core.PhaseProvider, "ecs", "us-east-2")
+	kPending := makeStepKey(core.PhaseProvider, "ecs", "eu-west-1")
+	m.checklistItems[kRun] = &stepItem{
+		Key:        kRun,
+		Phase:      core.PhaseProvider,
+		ProviderID: "ecs",
+		Region:     "us-east-1",
+		State:      stepRunning,
+		StartedAt:  now.Add(-7 * time.Second),
+		Message:    "listing",
+	}
+	m.checklistItems[kDone1] = &stepItem{
+		Key:                kDone1,
+		Phase:              core.PhaseProvider,
+		ProviderID:         "ecs",
+		Region:             "us-west-2",
+		State:              stepDone,
+		StepResourcesAdded: 6,
+		StepEdgesAdded:     3,
+	}
+	m.checklistItems[kDone2] = &stepItem{
+		Key:                kDone2,
+		Phase:              core.PhaseProvider,
+		ProviderID:         "ecs",
+		Region:             "us-east-2",
+		State:              stepDone,
+		StepResourcesAdded: 4,
+		StepEdgesAdded:     2,
+	}
+	m.checklistItems[kPending] = &stepItem{
+		Key:        kPending,
+		Phase:      core.PhaseProvider,
+		ProviderID: "ecs",
+		Region:     "eu-west-1",
+		State:      stepPending,
+	}
+	m.checklistOrder = append(m.checklistOrder, kRun, kDone1, kDone2, kPending)
+	m.expectedKeys[kRun] = struct{}{}
+	m.expectedKeys[kDone1] = struct{}{}
+	m.expectedKeys[kDone2] = struct{}{}
+	m.expectedKeys[kPending] = struct{}{}
+
+	lines := m.renderChecklistBody(160, 30, now)
+	joined := stripANSI(strings.Join(lines, "\n"))
+	if !strings.Contains(joined, "pending regions=1") {
+		t.Fatalf("expected pending region summary line, got:\n%s", joined)
+	}
+	if !strings.Contains(joined, "done regions=2 +res=10 +edges=5") {
+		t.Fatalf("expected done region summary line, got:\n%s", joined)
+	}
+	if strings.Contains(joined, "us-west-2       +res=6 +edges=3") {
+		t.Fatalf("expected done region rows to be compacted, got:\n%s", joined)
+	}
+}
+
+func requireChecklistKey(t *testing.T, m *model, key string) {
+	t.Helper()
+	if _, ok := m.checklistItems[key]; !ok {
+		t.Fatalf("missing checklist key %q", key)
 	}
 }
 

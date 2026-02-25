@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,6 +33,8 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 		elbv2TargetHealthConcurrency int
 		costConcurrency              int
 		targetSeconds                int
+		awsMaxAttempts               int
+		awsRetryMode                 string
 	)
 	cmd := &cobra.Command{
 		Use:   "scan",
@@ -42,6 +46,18 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 
 			if offline != nil && *offline {
 				return fmt.Errorf("--offline is not compatible with scan")
+			}
+			if awsMaxAttempts > 0 {
+				_ = os.Setenv("AWS_MAX_ATTEMPTS", strconv.Itoa(awsMaxAttempts))
+			}
+			awsRetryMode = strings.TrimSpace(strings.ToLower(awsRetryMode))
+			if awsRetryMode != "" {
+				switch awsRetryMode {
+				case "standard", "adaptive":
+					_ = os.Setenv("AWS_RETRY_MODE", awsRetryMode)
+				default:
+					return fmt.Errorf("invalid --aws-retry-mode %q (expected standard|adaptive)", awsRetryMode)
+				}
 			}
 
 			st, err := store.Open(store.OpenOptions{Path: *dbPath})
@@ -176,5 +192,7 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 	cmd.Flags().IntVar(&elbv2TargetHealthConcurrency, "elbv2-targethealth-concurrency", intEnvOr("AWSCOPE_ELBV2_TARGETHEALTH_CONCURRENCY", 30), "Max concurrent ELBv2 target health calls per resolver region")
 	cmd.Flags().IntVar(&costConcurrency, "cost-concurrency", intEnvOr("AWSCOPE_COST_CONCURRENCY", 16), "Max concurrent cost estimation workers")
 	cmd.Flags().IntVar(&targetSeconds, "target-seconds", intEnvOr("AWSCOPE_SCAN_TARGET_SECONDS", 60), "Scan target duration in seconds (reporting only)")
+	cmd.Flags().IntVar(&awsMaxAttempts, "aws-max-attempts", intEnvOr("AWS_MAX_ATTEMPTS", 0), "Override AWS SDK max retry attempts for this scan (0 keeps SDK default)")
+	cmd.Flags().StringVar(&awsRetryMode, "aws-retry-mode", strings.TrimSpace(os.Getenv("AWS_RETRY_MODE")), "Override AWS SDK retry mode for this scan (standard|adaptive)")
 	return cmd
 }
