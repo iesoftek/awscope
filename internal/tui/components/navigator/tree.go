@@ -243,6 +243,41 @@ func (m Model) View() string {
 	return m.list.View()
 }
 
+// FirstTypeForService returns the first type row that would be rendered for a
+// service after merging DB types and fallback types, using the same ordering as
+// the navigator list.
+func (m Model) FirstTypeForService(service string) string {
+	service = strings.TrimSpace(service)
+	if service == "" {
+		return ""
+	}
+	typeSet := map[string]bool{}
+	if typeCounts := m.typeCountsByService[service]; typeCounts != nil {
+		for typ := range typeCounts {
+			if strings.TrimSpace(typ) != "" {
+				typeSet[typ] = true
+			}
+		}
+	}
+	if m.fallbackTypes != nil {
+		for _, typ := range m.fallbackTypes(service) {
+			typ = strings.TrimSpace(typ)
+			if typ != "" {
+				typeSet[typ] = true
+			}
+		}
+	}
+	if len(typeSet) == 0 {
+		return ""
+	}
+	types := make([]string, 0, len(typeSet))
+	for typ := range typeSet {
+		types = append(types, typ)
+	}
+	sort.Strings(types)
+	return types[0]
+}
+
 func (m *Model) rebuild() {
 	items := make([]list.Item, 0, len(m.services)*2)
 	for _, svc := range m.services {
@@ -354,6 +389,10 @@ func (d treeDelegate) Render(w io.Writer, m list.Model, index int, li list.Item)
 	}
 
 	row := ii.row
+	padTrunc := func(s string, width int) string {
+		s = ansi.Truncate(strings.TrimSpace(s), width, "…")
+		return fmt.Sprintf("%-*s", width, s)
+	}
 	switch row.Kind {
 	case RowService:
 		arrow := "▸"
@@ -369,7 +408,7 @@ func (d treeDelegate) Render(w io.Writer, m list.Model, index int, li list.Item)
 		if d.icons != nil {
 			ico = icons.Pad(d.icons.Service(row.Service), 2)
 		}
-		plain := fmt.Sprintf("%s %s%-10s %d", arrow, ico, row.Service, row.Count)
+		plain := fmt.Sprintf("%s %s%s %d", arrow, ico, padTrunc(row.Service, 10), row.Count)
 		if row.ShowCost {
 			costStr := cost.FormatUSDPerMonthCompact(row.KnownUSD)
 			if row.UnknownCount > 0 {
@@ -394,7 +433,7 @@ func (d treeDelegate) Render(w io.Writer, m list.Model, index int, li list.Item)
 				if row.Count == 0 {
 					st = d.styles.IconDim
 				}
-				return st.Render(ic) + d.styles.Service.Render(fmt.Sprintf("%-10s", row.Service))
+				return st.Render(ic) + d.styles.Service.Render(padTrunc(row.Service, 10))
 			}(),
 			d.styles.Count.Render(fmt.Sprintf("%d", row.Count)),
 		)
@@ -413,7 +452,7 @@ func (d treeDelegate) Render(w io.Writer, m list.Model, index int, li list.Item)
 			if d.icons != nil {
 				ico = icons.Pad(d.icons.Type(typ), 2)
 			}
-			plain := fmt.Sprintf("  %s%-18s %d", ico, typ, row.Count)
+			plain := fmt.Sprintf("  %s%s %d", ico, padTrunc(typ, 18), row.Count)
 			if row.ShowCost {
 				costStr := cost.FormatUSDPerMonthCompact(row.KnownUSD)
 				if row.UnknownCount > 0 {
@@ -438,7 +477,7 @@ func (d treeDelegate) Render(w io.Writer, m list.Model, index int, li list.Item)
 					}
 					return st.Render(ic)
 				}(),
-				d.styles.Type.Render(fmt.Sprintf("%-18s", typ)),
+				d.styles.Type.Render(padTrunc(typ, 18)),
 				d.styles.Count.Render(fmt.Sprintf("%d", row.Count)),
 			)
 			if row.ShowCost {

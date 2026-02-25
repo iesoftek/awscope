@@ -34,6 +34,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mistakenelf/teacup/statusbar"
+	"github.com/muesli/reflow/wordwrap"
 
 	"awscope/internal/tui/widgets/table"
 )
@@ -48,6 +49,9 @@ const (
 	focusRegions
 	focusActions
 	focusConfirm
+	focusAudit
+	focusAuditFilter
+	focusAuditFacets
 )
 
 type detailsTab int
@@ -57,6 +61,22 @@ const (
 	detailsRelationships
 	detailsRaw
 )
+
+type auditMode int
+
+const (
+	auditModeList auditMode = iota
+	auditModeDetail
+)
+
+type auditFilters struct {
+	Text       string
+	Actions    map[string]bool
+	Services   map[string]bool
+	EventNames map[string]bool
+	Window     string // "24h"|"7d"|"30d"|"all"
+	OnlyErrors bool
+}
 
 type navFrame struct {
 	service     string
@@ -84,6 +104,7 @@ type model struct {
 	dbPath  string
 	offline bool
 	width   int
+	height  int
 	build   string
 
 	loader *aws.Loader
@@ -121,6 +142,42 @@ type model struct {
 	resourceSummaries []store.ResourceSummary
 	totalResources    int
 	pager             paginator.Model
+
+	auditOpen           bool
+	auditMode           auditMode
+	auditLoading        bool
+	auditTable          table.Model
+	auditFilter         textinput.Model
+	auditPager          paginator.Model
+	auditEvents         []store.CloudTrailEventSummary
+	auditTotal          int
+	auditPageNum        int
+	auditPageSize       int
+	auditHasNext        bool
+	auditHasPrev        bool
+	auditNextCursor     *store.CloudTrailCursor
+	auditPrevCursor     *store.CloudTrailCursor
+	auditDetail         *store.CloudTrailEventRow
+	auditDetailViewport viewport.Model
+	auditDetailPretty   string
+	auditDetailError    error
+	auditFilterSeq      int
+	auditQuerySeq       int
+
+	auditFilters auditFilters
+
+	auditFacetOpen            bool
+	auditFacetSection         int
+	auditFacetActionsCursor   int
+	auditFacetServicesCursor  int
+	auditFacetEventSearchOn   bool
+	auditFacetEventSearch     textinput.Model
+	auditFacetEventNamePicker list.Model
+	auditFacets               store.CloudTrailFacets
+	auditFacetDraft           auditFilters
+
+	auditPageCache      map[string]store.CloudTrailCursorPage
+	auditPageCacheOrder []string
 
 	graphMode    bool
 	graphRootKey graph.ResourceKey
@@ -183,6 +240,39 @@ type resourcesLoadedMsg struct {
 	summaries []store.ResourceSummary
 	total     int
 	err       error
+}
+
+type auditEventsLoadedMsg struct {
+	events []store.CloudTrailEventSummary
+	total  int
+	err    error
+}
+
+type auditDetailLoadedMsg struct {
+	event store.CloudTrailEventRow
+	found bool
+	err   error
+}
+
+type auditCursorPageLoadedMsg struct {
+	seq       int
+	cacheKey  string
+	page      store.CloudTrailCursorPage
+	pageNum   int
+	err       error
+	fromCache bool
+}
+
+type auditCountLoadedMsg struct {
+	seq   int
+	total int
+	err   error
+}
+
+type auditFacetsLoadedMsg struct {
+	seq    int
+	facets store.CloudTrailFacets
+	err    error
 }
 
 type serviceCountsLoadedMsg struct {
@@ -255,6 +345,11 @@ type filterDebouncedMsg struct {
 	value string
 }
 
+type auditFilterDebouncedMsg struct {
+	seq   int
+	value string
+}
+
 type rawLoadedMsg struct {
 	key     graph.ResourceKey
 	content string
@@ -288,20 +383,65 @@ func (i relItem) Description() string {
 }
 func (i relItem) FilterValue() string { return i.title + " " + string(i.otherKey) + " " + i.kind }
 
+type auditFacetEventItem struct {
+	name     string
+	count    int
+	selected bool
+}
+
+func (i auditFacetEventItem) Title() string {
+	prefix := "[ ]"
+	if i.selected {
+		prefix = "[x]"
+	}
+	return fmt.Sprintf("%s %s", prefix, i.name)
+}
+func (i auditFacetEventItem) Description() string { return fmt.Sprintf("%d", i.count) }
+func (i auditFacetEventItem) FilterValue() string { return i.name }
+
+func cloneBoolMap(src map[string]bool) map[string]bool {
+	if len(src) == 0 {
+		return map[string]bool{}
+	}
+	out := make(map[string]bool, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneAuditFilters(src auditFilters) auditFilters {
+	return auditFilters{
+		Text:       src.Text,
+		Actions:    cloneBoolMap(src.Actions),
+		Services:   cloneBoolMap(src.Services),
+		EventNames: cloneBoolMap(src.EventNames),
+		Window:     src.Window,
+		OnlyErrors: src.OnlyErrors,
+	}
+}
+
 type keyMap struct {
-	Quit     key.Binding
-	Focus    key.Binding
-	Filter   key.Binding
-	Regions  key.Binding
-	Actions  key.Binding
-	Refresh  key.Binding
-	Theme    key.Binding
-	Graph    key.Binding
-	Pricing  key.Binding
-	PrevPage key.Binding
-	NextPage key.Binding
-	Back     key.Binding
-	Help     key.Binding
+	Quit        key.Binding
+	Focus       key.Binding
+	Filter      key.Binding
+	Regions     key.Binding
+	Actions     key.Binding
+	Refresh     key.Binding
+	Theme       key.Binding
+	Graph       key.Binding
+	Pricing     key.Binding
+	Audit       key.Binding
+	AuditDetail key.Binding
+	AuditJump   key.Binding
+	AuditFacets key.Binding
+	AuditWindow key.Binding
+	AuditErrors key.Binding
+	AuditPage   key.Binding
+	PrevPage    key.Binding
+	NextPage    key.Binding
+	Back        key.Binding
+	Help        key.Binding
 
 	PaneNav       key.Binding
 	PaneResources key.Binding
@@ -313,13 +453,14 @@ type keyMap struct {
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Help, k.Focus, k.Filter, k.Regions, k.Actions, k.Graph, k.Pricing, k.PrevPage, k.NextPage, k.Back, k.Refresh, k.Quit}
+	return []key.Binding{k.Help, k.Focus, k.Filter, k.Regions, k.Actions, k.Graph, k.Audit, k.Pricing, k.PrevPage, k.NextPage, k.Back, k.Refresh, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
-		{k.Focus, k.Filter, k.Regions, k.Actions, k.Graph, k.Refresh},
+		{k.Focus, k.Filter, k.Regions, k.Actions, k.Graph, k.Audit, k.Refresh},
 		{k.PaneNav, k.PaneResources, k.PaneDetails, k.Summary, k.Related, k.Raw, k.Pricing, k.Theme},
+		{k.AuditDetail, k.AuditJump, k.AuditFacets, k.AuditWindow, k.AuditErrors, k.AuditPage},
 		{k.PrevPage, k.NextPage, k.Back},
 		{k.Help, k.Quit},
 	}
@@ -378,6 +519,7 @@ func (m *model) applyTheme() {
 	}
 	m.resources.SetStyles(tbl)
 	m.regionTable.SetStyles(tbl)
+	m.auditTable.SetStyles(tbl)
 	// Re-render row content that embeds style (e.g. dim "-").
 	includeStored := strings.EqualFold(m.selectedService, "logs") && strings.EqualFold(m.selectedType, "logs:log-group")
 	includeIAMKeyFields := strings.EqualFold(m.selectedService, "iam") && strings.EqualFold(m.selectedType, "iam:access-key")
@@ -387,6 +529,14 @@ func (m *model) applyTheme() {
 	}
 	m.resources.SetColumns(buildResourceColumns(w, m.pricingMode, includeStored, includeIAMKeyFields))
 	m.resources.SetRows(makeResourceRows(m.resourceSummaries, m.pricingMode, m.styles, m.icons, includeStored, includeIAMKeyFields))
+	auditW := 80
+	if m.width > 0 {
+		auditW = max(20, m.width-4)
+	} else if m.paneMidW > 0 {
+		auditW = m.paneMidW - 4
+	}
+	m.auditTable.SetColumns(buildAuditColumns(auditW))
+	m.auditTable.SetRows(makeAuditRows(m.auditEvents, m.styles, m.icons))
 
 	// Navigator.
 	m.nav.SetStyles(navigator.Styles{
@@ -430,6 +580,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			return m, nil
+		}
+		if m.auditOpen && m.focus != focusRegions {
+			if cmd, handled := m.handleAuditKey(msg); handled {
+				return m, cmd
+			}
+			// While audit viewer is open, ignore non-audit keys.
+			switch msg.String() {
+			case "q", "ctrl+c", "?":
+			default:
+				return m, nil
+			}
 		}
 
 		k := msg.String()
@@ -481,8 +642,45 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-		case "g":
+		case "E":
 			if m.focus == focusFilter || m.focus == focusConfirm || (m.focus == focusRegions && m.regionFilterOn) {
+				break
+			}
+			if m.auditOpen {
+				m.auditOpen = false
+				m.auditMode = auditModeList
+				m.auditFacetOpen = false
+				m.auditFilter.Blur()
+				if m.focus == focusAudit || m.focus == focusAuditFilter {
+					m.focus = focusResources
+				}
+				break
+			}
+			m.auditOpen = true
+			m.auditMode = auditModeList
+			m.focus = focusAudit
+			m.auditFacetOpen = false
+			m.auditLoading = true
+			m.auditDetail = nil
+			m.auditDetailPretty = ""
+			m.auditDetailViewport.SetContent("")
+			m.auditDetailViewport.GotoTop()
+			m.auditDetailError = nil
+			m.auditFilters.Text = strings.TrimSpace(m.auditFilter.Value())
+			if m.auditFilters.Window == "" {
+				m.auditFilters.Window = "7d"
+			}
+			if m.auditPageSize <= 0 {
+				m.auditPageSize = 100
+			}
+			m.resetAuditPaging()
+			m.clearAuditPageCache()
+			m.resizeAuditWidgets()
+			seq := m.nextAuditSeq()
+			cmds = append(cmds, tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)))
+
+		case "g":
+			if m.auditOpen || m.focus == focusFilter || m.focus == focusConfirm || (m.focus == focusRegions && m.regionFilterOn) {
 				break
 			}
 			if m.graphMode {
@@ -506,15 +704,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.loadNeighborsCmd())
 
 		case "1":
-			if m.focus != focusFilter && m.focus != focusConfirm && !(m.focus == focusRegions && m.regionFilterOn) {
+			if !m.auditOpen && m.focus != focusFilter && m.focus != focusConfirm && !(m.focus == focusRegions && m.regionFilterOn) {
 				m.focus = focusServices
 			}
 		case "2":
-			if m.focus != focusFilter && m.focus != focusConfirm && !(m.focus == focusRegions && m.regionFilterOn) {
+			if !m.auditOpen && m.focus != focusFilter && m.focus != focusConfirm && !(m.focus == focusRegions && m.regionFilterOn) {
 				m.focus = focusResources
 			}
 		case "3":
-			if m.focus != focusFilter && m.focus != focusConfirm && !(m.focus == focusRegions && m.regionFilterOn) {
+			if !m.auditOpen && m.focus != focusFilter && m.focus != focusConfirm && !(m.focus == focusRegions && m.regionFilterOn) {
 				m.focus = focusDetails
 			}
 
@@ -540,7 +738,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus = focusResources
 				m.filter.Blur()
 			case focusRegions:
-				m.focus = focusResources
+				if m.auditOpen {
+					m.auditMode = auditModeList
+					m.focus = focusAudit
+				} else {
+					m.focus = focusResources
+				}
 				m.regionFilterOn = false
 				m.regionFilter.Blur()
 				m.loading = true
@@ -555,9 +758,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case focusConfirm:
 				m.focus = focusActions
 				m.confirm.Blur()
+			case focusAudit:
+				// Keep focus within audit tool while open.
+				m.focus = focusAudit
+			case focusAuditFilter:
+				m.focus = focusAudit
+				m.auditFilter.Blur()
 			}
 
 		case "/":
+			if m.auditOpen && m.focus == focusAudit {
+				m.focus = focusAuditFilter
+				m.auditFilter.Focus()
+				break
+			}
 			if m.focus == focusRegions {
 				m.regionFilterOn = true
 				m.regionFilter.Focus()
@@ -616,7 +830,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.focus == focusRegions && !m.regionFilterOn {
 				m.selectOnlyCurrentRegion()
 				m.rebuildRegionTable("")
-				m.focus = focusResources
+				if m.auditOpen {
+					m.auditMode = auditModeList
+					m.focus = focusAudit
+				} else {
+					m.focus = focusResources
+				}
 				m.regionFilterOn = false
 				m.regionFilter.Blur()
 				m.loading = true
@@ -626,6 +845,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.pricingMode {
 					cmds = append(cmds, m.loadServiceCostAggCmd(), m.loadTypeCostAggCmd(m.nav.ExpandedService()))
 				}
+				if m.auditOpen {
+					m.auditFilters.Text = strings.TrimSpace(m.auditFilter.Value())
+					m.auditLoading = true
+					m.resetAuditPaging()
+					m.clearAuditPageCache()
+					seq := m.nextAuditSeq()
+					cmds = append(cmds, tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)))
+				}
 				break
 			}
 			// Details tab shortcut: Summary
@@ -634,7 +861,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "backspace":
-			if m.focus == focusFilter || m.focus == focusConfirm || (m.focus == focusRegions && m.regionFilterOn) {
+			if m.auditOpen || m.focus == focusFilter || m.focus == focusConfirm || (m.focus == focusRegions && m.regionFilterOn) || m.focus == focusAuditFilter {
 				break
 			}
 			if len(m.navStack) > 0 {
@@ -662,7 +889,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.regionFilter.Blur()
 					m.rebuildRegionTable("")
 				} else {
-					m.focus = focusResources
+					if m.auditOpen {
+						m.auditMode = auditModeList
+						m.focus = focusAudit
+					} else {
+						m.focus = focusResources
+					}
 				}
 			case focusActions:
 				m.focus = focusResources
@@ -670,10 +902,54 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus = focusActions
 				m.confirm.SetValue("")
 				m.confirm.Blur()
+			case focusAuditFilter:
+				m.focus = focusAudit
+				m.auditFilter.Blur()
+			case focusAudit:
+				m.auditOpen = false
+				m.focus = focusResources
 			}
 
 		case "enter":
 			switch {
+			case m.focus == focusAuditFilter:
+				m.focus = focusAudit
+				m.auditFilter.Blur()
+				m.auditLoading = true
+				m.auditPager.Page = 0
+				cmds = append(cmds, m.loadAuditEventsCmd())
+
+			case m.focus == focusAudit:
+				ev, ok := m.selectedAuditEvent()
+				if !ok {
+					m.statusLine = "no audit event selected"
+					break
+				}
+				if strings.TrimSpace(string(ev.ResourceKey)) == "" {
+					m.statusLine = "resource not in inventory for this event"
+					break
+				}
+				_, _, region, typ, _, err := graph.ParseResourceKey(ev.ResourceKey)
+				if err != nil {
+					m.statusLine = "cannot resolve target resource key"
+					break
+				}
+				service := ""
+				if parts := strings.SplitN(typ, ":", 2); len(parts) > 0 {
+					service = parts[0]
+				}
+				m.pushNav()
+				m.auditOpen = false
+				m.auditFilter.Blur()
+				m.jumpTo(service, region, ev.ResourceKey)
+				m.syncNavigatorSelection()
+				m.loading = true
+				m.err = nil
+				cmds = append(cmds, m.loadServiceCountsCmd(), m.loadTypeCountsCmd(m.nav.ExpandedService()), m.loadResourcesCmd(), m.loadNeighborsCmd())
+				if m.pricingMode {
+					cmds = append(cmds, m.loadServiceCostAggCmd(), m.loadTypeCostAggCmd(m.nav.ExpandedService()))
+				}
+
 			case m.focus == focusFilter:
 				m.focus = focusResources
 				m.filter.Blur()
@@ -689,7 +965,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.rebuildRegionTable("")
 					break
 				}
-				m.focus = focusResources
+				if m.auditOpen {
+					m.auditMode = auditModeList
+					m.focus = focusAudit
+				} else {
+					m.focus = focusResources
+				}
 				m.regionFilterOn = false
 				m.regionFilter.Blur()
 				m.loading = true
@@ -698,6 +979,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmds = append(cmds, m.loadServiceCountsCmd(), m.loadTypeCountsCmd(m.nav.ExpandedService()), m.loadResourcesCmd())
 				if m.pricingMode {
 					cmds = append(cmds, m.loadServiceCostAggCmd(), m.loadTypeCostAggCmd(m.nav.ExpandedService()))
+				}
+				if m.auditOpen {
+					m.auditFilters.Text = strings.TrimSpace(m.auditFilter.Value())
+					m.auditLoading = true
+					m.resetAuditPaging()
+					m.clearAuditPageCache()
+					seq := m.nextAuditSeq()
+					cmds = append(cmds, tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)))
 				}
 
 			case m.focus == focusDetails && m.detailsTab == detailsRelationships:
@@ -831,6 +1120,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.loading = true
 				m.err = nil
 				cmds = append(cmds, m.loadResourcesCmd())
+			} else if m.focus == focusAudit && !m.auditPager.OnFirstPage() {
+				m.auditPager.PrevPage()
+				m.auditLoading = true
+				cmds = append(cmds, m.loadAuditEventsCmd())
 			}
 		case "]":
 			if m.focus == focusResources && !m.graphMode && !m.pager.OnLastPage() {
@@ -838,6 +1131,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.loading = true
 				m.err = nil
 				cmds = append(cmds, m.loadResourcesCmd())
+			} else if m.focus == focusAudit && !m.auditPager.OnLastPage() {
+				m.auditPager.NextPage()
+				m.auditLoading = true
+				cmds = append(cmds, m.loadAuditEventsCmd())
 			}
 
 		case "ctrl+r":
@@ -850,6 +1147,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.loadIdentityCmd(), m.loadRegionsCmd(), m.loadRegionCountsCmd(), m.loadServiceCountsCmd(), m.loadTypeCountsCmd(m.nav.ExpandedService()), m.loadResourcesCmd(), m.loadNeighborsCmd())
 			if m.pricingMode {
 				cmds = append(cmds, m.loadServiceCostAggCmd(), m.loadTypeCostAggCmd(m.nav.ExpandedService()))
+			}
+			if m.auditOpen {
+				m.auditLoading = true
+				m.auditFilters.Text = strings.TrimSpace(m.auditFilter.Value())
+				m.resetAuditPaging()
+				m.clearAuditPageCache()
+				seq := m.nextAuditSeq()
+				cmds = append(cmds, tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)))
 			}
 
 		case " ":
@@ -882,6 +1187,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.loadRegionCountsCmd(), m.loadServiceCountsCmd(), m.loadTypeCountsCmd(m.nav.ExpandedService()))
 			if m.pricingMode {
 				cmds = append(cmds, m.loadServiceCostAggCmd(), m.loadTypeCostAggCmd(m.nav.ExpandedService()))
+			}
+			if m.auditOpen {
+				m.auditFilters.Text = strings.TrimSpace(m.auditFilter.Value())
+				m.auditLoading = true
+				m.resetAuditPaging()
+				m.clearAuditPageCache()
+				seq := m.nextAuditSeq()
+				cmds = append(cmds, tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)))
 			}
 		}
 
@@ -954,6 +1267,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.loadResourcesCmd(),
 				m.loadNeighborsCmd(),
 			)
+			if m.auditOpen {
+				m.auditFilters.Text = strings.TrimSpace(m.auditFilter.Value())
+				m.auditLoading = true
+				m.resetAuditPaging()
+				m.clearAuditPageCache()
+				seq := m.nextAuditSeq()
+				cmds = append(cmds, tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)))
+			}
 		}
 
 	case resourcesLoadedMsg:
@@ -1006,6 +1327,125 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case auditEventsLoadedMsg:
+		m.auditLoading = false
+		if msg.err != nil {
+			m.auditDetailError = msg.err
+			break
+		}
+		m.auditDetailError = nil
+		m.auditEvents = msg.events
+		m.auditTotal = msg.total
+		if m.auditPager.PerPage <= 0 {
+			m.auditPager.PerPage = 25
+		}
+		if msg.total <= 0 {
+			m.auditPager.TotalPages = 1
+			m.auditPager.Page = 0
+		} else {
+			m.auditPager.SetTotalPages(msg.total)
+			if m.auditPager.Page > m.auditPager.TotalPages-1 {
+				m.auditPager.Page = max(0, m.auditPager.TotalPages-1)
+			}
+		}
+		m.resizeAuditWidgets()
+		m.auditTable.SetRows(makeAuditRows(msg.events, m.styles, m.icons))
+		m.auditTable.SetCursor(0)
+		if m.auditMode == auditModeDetail {
+			if ev, ok := m.selectedAuditEvent(); ok {
+				cmds = append(cmds, m.loadAuditDetailCmd(ev.EventID))
+			} else {
+				m.auditDetail = nil
+				m.auditDetailPretty = ""
+				m.auditDetailViewport.SetContent("")
+			}
+		} else {
+			m.auditDetail = nil
+			m.auditDetailPretty = ""
+		}
+
+	case auditCursorPageLoadedMsg:
+		if msg.seq != m.auditQuerySeq {
+			break
+		}
+		m.auditLoading = false
+		if msg.err != nil {
+			m.auditDetailError = msg.err
+			break
+		}
+		m.auditDetailError = nil
+		m.putAuditPageCache(msg.cacheKey, msg.page)
+		m.auditEvents = msg.page.Events
+		m.auditHasNext = msg.page.HasNext
+		m.auditHasPrev = msg.page.HasPrev
+		m.auditNextCursor = msg.page.NextCursor
+		m.auditPrevCursor = msg.page.PrevCursor
+		m.auditPageNum = msg.pageNum
+		if m.auditPageNum < 1 {
+			m.auditPageNum = 1
+		}
+		m.auditPager.Page = max(0, m.auditPageNum-1)
+		m.resizeAuditWidgets()
+		m.auditTable.SetRows(makeAuditRows(msg.page.Events, m.styles, m.icons))
+		m.auditTable.SetCursor(0)
+		if m.auditMode == auditModeDetail {
+			if ev, ok := m.selectedAuditEvent(); ok {
+				cmds = append(cmds, m.loadAuditDetailCmd(ev.EventID))
+			} else {
+				m.auditMode = auditModeList
+				m.auditDetail = nil
+				m.auditDetailPretty = ""
+				m.auditDetailViewport.SetContent("")
+			}
+		} else {
+			m.auditDetail = nil
+			m.auditDetailPretty = ""
+		}
+
+	case auditCountLoadedMsg:
+		if msg.seq != m.auditQuerySeq {
+			break
+		}
+		if msg.err != nil {
+			m.auditDetailError = msg.err
+			break
+		}
+		m.auditTotal = msg.total
+		per := max(1, m.auditPageSize)
+		pages := (msg.total + per - 1) / per
+		m.auditPager.SetTotalPages(max(1, pages))
+
+	case auditFacetsLoadedMsg:
+		if msg.seq != m.auditQuerySeq {
+			break
+		}
+		if msg.err != nil {
+			m.auditDetailError = msg.err
+			break
+		}
+		m.auditFacets = msg.facets
+		m.applyAuditFacetsToPicker()
+
+	case auditDetailLoadedMsg:
+		if msg.err != nil {
+			m.auditDetailError = msg.err
+			break
+		}
+		if !msg.found {
+			m.auditDetail = nil
+			m.auditDetailError = nil
+			m.auditDetailPretty = ""
+			m.auditDetailViewport.SetContent("")
+			break
+		}
+		d := msg.event
+		m.auditDetail = &d
+		m.auditDetailError = nil
+		m.auditDetailPretty = formatAuditJSON(d.EventJSON)
+		m.resizeAuditWidgets()
+		m.auditDetailViewport.SetContent(wrapAuditPayload(m.auditDetailPretty, m.auditDetailViewport.Width))
+		m.auditDetailViewport.GotoTop()
+
 	case neighborsLoadedMsg:
 		m.err = msg.err
 		if msg.err == nil {
@@ -1032,6 +1472,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
+		m.height = msg.Height
 		w := msg.Width
 		h := msg.Height
 		left, mid, right := computePaneWidths(w)
@@ -1058,6 +1499,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.regionTable.SetHeight(max(6, h-12))
 		m.regionTable.SetColumns(buildRegionColumns(mid - 4))
 		m.regionFilter.Width = min(30, max(10, mid-16))
+		m.resizeAuditWidgets()
 		// Graph Lens side lists are sized dynamically in View(), but we still update height here.
 		lensH := max(4, h-11)
 		sideW := max(12, (mid-10)/3)
@@ -1085,6 +1527,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	} else {
 		m.regionTable.Blur()
 	}
+	if m.focus == focusAudit && m.auditMode == auditModeList {
+		m.auditTable.Focus()
+	} else {
+		m.auditTable.Blur()
+	}
 
 	// Delegate updates based on focus.
 	switch m.focus {
@@ -1104,7 +1551,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if after.Service != "" && after.Service != m.selectedService {
 					m.selectedService = after.Service
-					m.selectedType = defaultTypeForService(after.Service)
+					// When browsing with arrows, select the first visible type for the service.
+					// This keeps navigator movement deterministic and avoids jumping to a
+					// non-first child from hard-coded defaults.
+					m.selectedType = m.nav.FirstTypeForService(after.Service)
+					if m.selectedType == "" {
+						m.selectedType = defaultTypeForService(after.Service)
+					}
 					m.nav.SetSelection(m.selectedService, m.selectedType)
 					m.applyServiceScope()
 					m.rebuildRegionTable("")
@@ -1202,6 +1655,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.confirm, cmd = m.confirm.Update(msg)
 		cmds = append(cmds, cmd)
+	case focusAudit:
+		var cmd tea.Cmd
+		if m.auditMode == auditModeDetail {
+			m.auditDetailViewport, cmd = m.auditDetailViewport.Update(msg)
+		} else {
+			m.auditTable, cmd = m.auditTable.Update(msg)
+		}
+		cmds = append(cmds, cmd)
+	case focusAuditFilter:
+		before := m.auditFilter.Value()
+		var cmd tea.Cmd
+		m.auditFilter, cmd = m.auditFilter.Update(msg)
+		cmds = append(cmds, cmd)
+		if after := m.auditFilter.Value(); after != before {
+			m.auditFilterSeq++
+			seq := m.auditFilterSeq
+			val := after
+			cmds = append(cmds, tea.Tick(200*time.Millisecond, func(_ time.Time) tea.Msg {
+				return auditFilterDebouncedMsg{seq: seq, value: val}
+			}))
+		}
 	}
 
 	// Refresh neighbors on selection movement in the resource table.
@@ -1223,13 +1697,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	}
-
 	if dm, ok := msg.(filterDebouncedMsg); ok {
 		if m.focus == focusFilter && dm.seq == m.filterSeq && dm.value == m.filter.Value() {
 			m.loading = true
 			m.err = nil
 			m.pager.Page = 0
 			cmds = append(cmds, m.loadResourcesCmd())
+		}
+	}
+	if dm, ok := msg.(auditFilterDebouncedMsg); ok {
+		if m.focus == focusAuditFilter && dm.seq == m.auditFilterSeq && dm.value == m.auditFilter.Value() {
+			m.auditLoading = true
+			m.auditFilters.Text = strings.TrimSpace(dm.value)
+			m.resetAuditPaging()
+			m.clearAuditPageCache()
+			seq := m.nextAuditSeq()
+			cmds = append(cmds, tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)))
 		}
 	}
 
@@ -1245,7 +1728,557 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+func (m *model) handleAuditKey(msg tea.KeyMsg) (tea.Cmd, bool) {
+	if m.auditFacetOpen {
+		switch msg.String() {
+		case "esc":
+			if m.auditFacetEventSearchOn {
+				m.auditFacetEventSearchOn = false
+				m.auditFacetEventSearch.Blur()
+				return nil, true
+			}
+			m.auditFacetOpen = false
+			m.focus = focusAudit
+			return nil, true
+		case "enter":
+			if m.auditFacetEventSearchOn {
+				m.auditFacetEventSearchOn = false
+				m.auditFacetEventSearch.Blur()
+				return nil, true
+			}
+			m.auditFilters.Actions = cloneBoolMap(m.auditFacetDraft.Actions)
+			m.auditFilters.Services = cloneBoolMap(m.auditFacetDraft.Services)
+			m.auditFilters.EventNames = cloneBoolMap(m.auditFacetDraft.EventNames)
+			m.auditFilters.OnlyErrors = m.auditFacetDraft.OnlyErrors
+			m.auditFacetOpen = false
+			m.focus = focusAudit
+			m.auditLoading = true
+			m.resetAuditPaging()
+			m.clearAuditPageCache()
+			seq := m.nextAuditSeq()
+			return tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)), true
+		case "c", "C":
+			m.auditFacetDraft.Actions = map[string]bool{}
+			m.auditFacetDraft.Services = map[string]bool{}
+			m.auditFacetDraft.EventNames = map[string]bool{}
+			m.applyAuditFacetsToPicker()
+			return nil, true
+		case "tab", "right", "l":
+			m.auditFacetSection = (m.auditFacetSection + 1) % 3
+			return nil, true
+		case "left", "h":
+			m.auditFacetSection = (m.auditFacetSection + 2) % 3
+			return nil, true
+		case "/":
+			if m.auditFacetSection == 2 {
+				m.auditFacetEventSearchOn = true
+				m.auditFacetEventSearch.Focus()
+			}
+			return nil, true
+		case "e":
+			m.auditFacetDraft.OnlyErrors = !m.auditFacetDraft.OnlyErrors
+			return nil, true
+		}
+
+		if m.auditFacetEventSearchOn {
+			before := m.auditFacetEventSearch.Value()
+			var cmd tea.Cmd
+			m.auditFacetEventSearch, cmd = m.auditFacetEventSearch.Update(msg)
+			if m.auditFacetEventSearch.Value() != before {
+				m.applyAuditFacetsToPicker()
+			}
+			return cmd, true
+		}
+		switch m.auditFacetSection {
+		case 0:
+			switch msg.String() {
+			case "up", "k":
+				if m.auditFacetActionsCursor > 0 {
+					m.auditFacetActionsCursor--
+				}
+			case "down", "j":
+				if m.auditFacetActionsCursor < 1 {
+					m.auditFacetActionsCursor++
+				}
+			case " ":
+				action := "create"
+				if m.auditFacetActionsCursor == 1 {
+					action = "delete"
+				}
+				if m.auditFacetDraft.Actions[action] {
+					delete(m.auditFacetDraft.Actions, action)
+				} else {
+					m.auditFacetDraft.Actions[action] = true
+				}
+			}
+			return nil, true
+		case 1:
+			n := len(m.auditFacets.Services)
+			if n == 0 {
+				return nil, true
+			}
+			if m.auditFacetServicesCursor >= n {
+				m.auditFacetServicesCursor = n - 1
+			}
+			switch msg.String() {
+			case "up", "k":
+				if m.auditFacetServicesCursor > 0 {
+					m.auditFacetServicesCursor--
+				}
+			case "down", "j":
+				if m.auditFacetServicesCursor < n-1 {
+					m.auditFacetServicesCursor++
+				}
+			case " ":
+				svc := strings.TrimSpace(m.auditFacets.Services[m.auditFacetServicesCursor].Value)
+				if svc != "" {
+					if m.auditFacetDraft.Services[svc] {
+						delete(m.auditFacetDraft.Services, svc)
+					} else {
+						m.auditFacetDraft.Services[svc] = true
+					}
+				}
+			}
+			return nil, true
+		default:
+			if msg.String() == " " {
+				m.toggleSelectedAuditFacetEvent()
+				return nil, true
+			}
+			var cmd tea.Cmd
+			m.auditFacetEventNamePicker, cmd = m.auditFacetEventNamePicker.Update(msg)
+			return cmd, true
+		}
+	}
+
+	// While typing in the audit text filter, don't trigger global audit hotkeys.
+	// Exit input mode explicitly with Enter/Esc/Tab, then hotkeys become active again.
+	if m.focus == focusAuditFilter {
+		switch msg.String() {
+		case "esc", "tab":
+			m.focus = focusAudit
+			m.auditFilter.Blur()
+			return nil, true
+		case "enter", "ctrl+r":
+			m.focus = focusAudit
+			m.auditFilter.Blur()
+			m.auditMode = auditModeList
+			m.auditLoading = true
+			m.auditFilters.Text = strings.TrimSpace(m.auditFilter.Value())
+			m.resetAuditPaging()
+			m.clearAuditPageCache()
+			seq := m.nextAuditSeq()
+			return tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)), true
+		default:
+			before := m.auditFilter.Value()
+			var cmd tea.Cmd
+			m.auditFilter, cmd = m.auditFilter.Update(msg)
+			if after := m.auditFilter.Value(); after != before {
+				m.auditFilterSeq++
+				seq := m.auditFilterSeq
+				val := after
+				return tea.Batch(cmd, tea.Tick(200*time.Millisecond, func(_ time.Time) tea.Msg {
+					return auditFilterDebouncedMsg{seq: seq, value: val}
+				})), true
+			}
+			return cmd, true
+		}
+	}
+
+	switch msg.String() {
+	case "q", "ctrl+c", "?":
+		return nil, false
+	case "E":
+		m.auditOpen = false
+		m.auditMode = auditModeList
+		m.auditFacetOpen = false
+		m.auditFilter.Blur()
+		m.focus = focusResources
+		return nil, true
+	case "R":
+		if m.focus == focusFilter || m.focus == focusConfirm || (m.focus == focusRegions && m.regionFilterOn) {
+			return nil, true
+		}
+		m.auditMode = auditModeList
+		m.focus = focusRegions
+		m.auditFilter.Blur()
+		m.filter.Blur()
+		m.regionFilterOn = false
+		m.regionFilter.Blur()
+		m.regionFilter.SetValue("")
+		m.rebuildRegionTable("")
+		return m.loadRegionCountsCmd(), true
+	case "/":
+		if m.auditMode == auditModeList && m.focus == focusAudit {
+			m.focus = focusAuditFilter
+			m.auditFilter.Focus()
+		}
+		return nil, true
+	case "tab":
+		if m.focus == focusAuditFilter {
+			m.focus = focusAudit
+			m.auditFilter.Blur()
+		}
+		return nil, true
+	case "F":
+		m.openAuditFacetModal()
+		return nil, true
+	case "T":
+		switch normalizeAuditWindow(m.auditFilters.Window) {
+		case "24h":
+			m.auditFilters.Window = "7d"
+		case "7d":
+			m.auditFilters.Window = "30d"
+		case "30d":
+			m.auditFilters.Window = "all"
+		default:
+			m.auditFilters.Window = "24h"
+		}
+		m.auditLoading = true
+		m.resetAuditPaging()
+		m.clearAuditPageCache()
+		seq := m.nextAuditSeq()
+		return tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)), true
+	case "e":
+		m.auditFilters.OnlyErrors = !m.auditFilters.OnlyErrors
+		m.auditLoading = true
+		m.resetAuditPaging()
+		m.clearAuditPageCache()
+		seq := m.nextAuditSeq()
+		return tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)), true
+	case "+":
+		switch m.auditPageSize {
+		case 50:
+			m.auditPageSize = 100
+		case 100:
+			m.auditPageSize = 200
+		default:
+			m.auditPageSize = 50
+		}
+		m.auditLoading = true
+		m.resetAuditPaging()
+		m.clearAuditPageCache()
+		seq := m.nextAuditSeq()
+		return tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)), true
+	case "-":
+		switch m.auditPageSize {
+		case 200:
+			m.auditPageSize = 100
+		case 100:
+			m.auditPageSize = 50
+		default:
+			m.auditPageSize = 200
+		}
+		m.auditLoading = true
+		m.resetAuditPaging()
+		m.clearAuditPageCache()
+		seq := m.nextAuditSeq()
+		return tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)), true
+	case "esc":
+		switch {
+		case m.focus == focusAuditFilter:
+			m.focus = focusAudit
+			m.auditFilter.Blur()
+		case m.auditMode == auditModeDetail:
+			m.auditMode = auditModeList
+			m.focus = focusAudit
+		default:
+			m.auditOpen = false
+			m.auditMode = auditModeList
+			m.auditFacetOpen = false
+			m.auditFilter.Blur()
+			m.focus = focusResources
+		}
+		return nil, true
+	case "enter":
+		if m.focus == focusAuditFilter {
+			m.focus = focusAudit
+			m.auditFilter.Blur()
+			m.auditMode = auditModeList
+			m.auditLoading = true
+			m.auditFilters.Text = strings.TrimSpace(m.auditFilter.Value())
+			m.resetAuditPaging()
+			m.clearAuditPageCache()
+			seq := m.nextAuditSeq()
+			return tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)), true
+		}
+		if m.focus == focusAudit && m.auditMode == auditModeList {
+			ev, ok := m.selectedAuditEvent()
+			if !ok {
+				m.statusLine = "no audit event selected"
+				return nil, true
+			}
+			m.auditMode = auditModeDetail
+			m.auditDetail = nil
+			m.auditDetailError = nil
+			m.auditDetailPretty = ""
+			m.resizeAuditWidgets()
+			m.auditDetailViewport.SetContent("(loading event detail...)")
+			m.auditDetailViewport.GotoTop()
+			return m.loadAuditDetailCmd(ev.EventID), true
+		}
+		return nil, true
+	case "J":
+		return m.jumpFromSelectedAuditEvent(), true
+	case "[":
+		if m.auditMode == auditModeList && m.focus == focusAudit && m.auditHasPrev {
+			m.auditLoading = true
+			return m.loadAuditPrevPageCmd(m.auditQuerySeq), true
+		}
+		return nil, true
+	case "]":
+		if m.auditMode == auditModeList && m.focus == focusAudit && m.auditHasNext {
+			m.auditLoading = true
+			return m.loadAuditNextPageCmd(m.auditQuerySeq), true
+		}
+		return nil, true
+	case "ctrl+r":
+		if m.focus == focusAuditFilter {
+			m.focus = focusAudit
+			m.auditFilter.Blur()
+		}
+		m.auditMode = auditModeList
+		m.auditLoading = true
+		m.auditFilters.Text = strings.TrimSpace(m.auditFilter.Value())
+		m.resetAuditPaging()
+		m.clearAuditPageCache()
+		seq := m.nextAuditSeq()
+		return tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)), true
+	}
+
+	if m.focus != focusAudit {
+		return nil, false
+	}
+	if m.auditMode == auditModeDetail {
+		var cmd tea.Cmd
+		m.auditDetailViewport, cmd = m.auditDetailViewport.Update(msg)
+		return cmd, true
+	}
+	// Audit key handling returns early from Update(), so restore table focus here.
+	// Without this, returning detail->list can leave the table blurred and inert.
+	if !m.auditTable.Focused() {
+		m.auditTable.Focus()
+	}
+	var cmd tea.Cmd
+	m.auditTable, cmd = m.auditTable.Update(msg)
+	return cmd, true
+}
+
+func (m *model) jumpFromSelectedAuditEvent() tea.Cmd {
+	ev, ok := m.selectedAuditEvent()
+	if !ok {
+		m.statusLine = "no audit event selected"
+		return nil
+	}
+	if strings.TrimSpace(string(ev.ResourceKey)) == "" {
+		m.statusLine = "resource not in inventory for this event"
+		return nil
+	}
+	_, _, region, typ, _, err := graph.ParseResourceKey(ev.ResourceKey)
+	if err != nil {
+		m.statusLine = "cannot resolve target resource key"
+		return nil
+	}
+	service := ""
+	if parts := strings.SplitN(typ, ":", 2); len(parts) > 0 {
+		service = parts[0]
+	}
+	m.pushNav()
+	m.auditOpen = false
+	m.auditMode = auditModeList
+	m.auditFacetOpen = false
+	m.auditFilter.Blur()
+	m.jumpTo(service, region, ev.ResourceKey)
+	m.syncNavigatorSelection()
+	m.loading = true
+	m.err = nil
+	cmds := []tea.Cmd{
+		m.loadServiceCountsCmd(),
+		m.loadTypeCountsCmd(m.nav.ExpandedService()),
+		m.loadResourcesCmd(),
+		m.loadNeighborsCmd(),
+	}
+	if m.pricingMode {
+		cmds = append(cmds, m.loadServiceCostAggCmd(), m.loadTypeCostAggCmd(m.nav.ExpandedService()))
+	}
+	return tea.Batch(cmds...)
+}
+
+func (m *model) resizeAuditWidgets() {
+	w := m.width
+	if w <= 0 {
+		w = 100
+	}
+	h := m.height
+	if h <= 0 {
+		h = 32
+	}
+
+	tableW := max(20, w-4)
+	m.auditTable.SetWidth(tableW)
+	m.auditTable.SetHeight(max(8, h-11))
+	m.auditTable.SetColumns(buildAuditColumns(tableW))
+	m.auditFilter.Width = min(40, max(12, tableW-26))
+
+	payloadW := max(20, w-8)
+	if w >= 150 {
+		leftW := max(36, w/3)
+		payloadW = max(40, w-leftW-10)
+	}
+	payloadH := max(6, h-18)
+	m.auditDetailViewport.Width = payloadW
+	m.auditDetailViewport.Height = payloadH
+	if strings.TrimSpace(m.auditDetailPretty) != "" {
+		m.auditDetailViewport.SetContent(wrapAuditPayload(m.auditDetailPretty, payloadW))
+	}
+	eventW := max(20, (w-14)/3+6)
+	eventH := max(8, h-18)
+	m.auditFacetEventNamePicker.SetSize(eventW, eventH)
+	m.auditFacetEventSearch.Width = max(16, eventW-10)
+}
+
+func formatAuditJSON(raw []byte) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return "{}"
+	}
+	var doc any
+	if err := json.Unmarshal(trimmed, &doc); err != nil {
+		return string(trimmed)
+	}
+	pretty, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return string(trimmed)
+	}
+	return string(pretty)
+}
+
+func wrapAuditPayload(s string, width int) string {
+	if width <= 1 {
+		return s
+	}
+	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		if ln == "" {
+			out = append(out, "")
+			continue
+		}
+		out = append(out, wordwrap.String(ln, width))
+	}
+	return strings.Join(out, "\n")
+}
+
+func (m *model) putAuditPageCache(key string, page store.CloudTrailCursorPage) {
+	if m == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	if m.auditPageCache == nil {
+		m.auditPageCache = map[string]store.CloudTrailCursorPage{}
+	}
+	if _, exists := m.auditPageCache[key]; !exists {
+		m.auditPageCacheOrder = append(m.auditPageCacheOrder, key)
+	}
+	m.auditPageCache[key] = page
+	const capN = 8
+	for len(m.auditPageCacheOrder) > capN {
+		evict := m.auditPageCacheOrder[0]
+		m.auditPageCacheOrder = m.auditPageCacheOrder[1:]
+		delete(m.auditPageCache, evict)
+	}
+}
+
+func (m *model) clearAuditPageCache() {
+	if m == nil {
+		return
+	}
+	m.auditPageCache = map[string]store.CloudTrailCursorPage{}
+	m.auditPageCacheOrder = nil
+}
+
+func (m *model) nextAuditSeq() int {
+	m.auditQuerySeq++
+	return m.auditQuerySeq
+}
+
+func (m *model) resetAuditPaging() {
+	m.auditPageNum = 1
+	m.auditHasPrev = false
+	m.auditHasNext = false
+	m.auditPrevCursor = nil
+	m.auditNextCursor = nil
+}
+
+func (m *model) applyAuditFacetsToPicker() {
+	items := make([]list.Item, 0, len(m.auditFacets.EventNames))
+	search := strings.ToLower(strings.TrimSpace(m.auditFacetEventSearch.Value()))
+	for _, fc := range m.auditFacets.EventNames {
+		name := strings.TrimSpace(fc.Value)
+		if name == "" {
+			continue
+		}
+		if search != "" && !strings.Contains(strings.ToLower(name), search) {
+			continue
+		}
+		items = append(items, auditFacetEventItem{
+			name:     name,
+			count:    fc.Count,
+			selected: m.auditFacetDraft.EventNames[name],
+		})
+	}
+	m.auditFacetEventNamePicker.SetItems(items)
+}
+
+func (m *model) selectedAuditFacetItem() (auditFacetEventItem, bool) {
+	it := m.auditFacetEventNamePicker.SelectedItem()
+	v, ok := it.(auditFacetEventItem)
+	return v, ok
+}
+
+func (m *model) toggleSelectedAuditFacetEvent() {
+	it, ok := m.selectedAuditFacetItem()
+	if !ok {
+		return
+	}
+	name := strings.TrimSpace(it.name)
+	if name == "" {
+		return
+	}
+	if m.auditFacetDraft.EventNames == nil {
+		m.auditFacetDraft.EventNames = map[string]bool{}
+	}
+	if m.auditFacetDraft.EventNames[name] {
+		delete(m.auditFacetDraft.EventNames, name)
+	} else {
+		m.auditFacetDraft.EventNames[name] = true
+	}
+	m.applyAuditFacetsToPicker()
+}
+
+func (m *model) openAuditFacetModal() {
+	m.auditFacetOpen = true
+	m.auditFacetSection = 0
+	m.focus = focusAuditFacets
+	m.auditFacetDraft = cloneAuditFilters(m.auditFilters)
+	if m.auditFacetDraft.Actions == nil {
+		m.auditFacetDraft.Actions = map[string]bool{}
+	}
+	if m.auditFacetDraft.Services == nil {
+		m.auditFacetDraft.Services = map[string]bool{}
+	}
+	if m.auditFacetDraft.EventNames == nil {
+		m.auditFacetDraft.EventNames = map[string]bool{}
+	}
+	m.auditFacetEventSearchOn = false
+	m.auditFacetEventSearch.Blur()
+	m.applyAuditFacetsToPicker()
+}
+
 func (m model) View() string {
+	if m.auditOpen {
+		return m.auditFullScreenView()
+	}
+
 	// Pane headers should be visually distinct from content and reflect focus.
 	headerStyle := m.styles.Title
 	focusStyle := m.styles.TitleFocus
@@ -1279,6 +2312,13 @@ func (m model) View() string {
 	if m.focus == focusActions || m.focus == focusConfirm {
 		resHeader = focusStyle.Render("Actions")
 	}
+	if m.focus == focusAudit || m.focus == focusAuditFilter || m.focus == focusAuditFacets {
+		if m.auditTotal > 0 {
+			resHeader = focusStyle.Render(fmt.Sprintf("Audit Events %s (%d)", m.auditPager.View(), m.auditTotal))
+		} else {
+			resHeader = focusStyle.Render("Audit Events")
+		}
+	}
 	if m.focus == focusDetails {
 		tab := "Summary"
 		if m.detailsTab == detailsRelationships {
@@ -1290,13 +2330,16 @@ func (m model) View() string {
 	}
 
 	filterLine := fmt.Sprintf("filter: %s", m.filter.View())
+	if m.auditOpen {
+		filterLine = fmt.Sprintf("audit: %s", m.auditFilter.View())
+	}
 
 	leftBorder := m.styles.PaneBorder
 	midBorder := m.styles.PaneBorder
 	rightBorder := m.styles.PaneBorder
 	if m.focus == focusServices {
 		leftBorder = m.styles.PaneBorderFocus
-	} else if m.focus == focusResources || m.focus == focusFilter || m.focus == focusRegions || m.focus == focusActions || m.focus == focusConfirm {
+	} else if m.focus == focusResources || m.focus == focusFilter || m.focus == focusRegions || m.focus == focusActions || m.focus == focusConfirm || m.focus == focusAudit || m.focus == focusAuditFilter || m.focus == focusAuditFacets {
 		midBorder = m.styles.PaneBorderFocus
 	} else {
 		rightBorder = m.styles.PaneBorderFocus
@@ -1326,6 +2369,11 @@ func (m model) View() string {
 			"",
 			"Pricing (p):",
 			"  toggle pricing mode (adds navigator totals and table column)",
+			"",
+			"Audit (E):",
+			"  full-screen create/delete CloudTrail events (indexed during scan)",
+			"  / text | F facets | T window | e errors-only | +/- page size",
+			"  [ ] cursor page | enter detail | J jump | esc back/close",
 			"",
 			"Icons:",
 			"  set AWSCOPE_ICONS=ascii|nerd|none or use --icons (default: nerd)",
@@ -1408,6 +2456,8 @@ func (m model) View() string {
 		status = "error: " + m.err.Error()
 	} else if m.statusLine != "" {
 		status = m.statusLine
+	} else if m.auditOpen {
+		status = "audit: create/delete events (last 7d) for selected regions"
 	} else if m.focus == focusRegions {
 		status = "regions: space toggle | a/* all | n only | s solo+apply | i invert | / find | enter apply | esc cancel"
 	}
@@ -1421,6 +2471,12 @@ func (m model) View() string {
 		return "LIST"
 	}(), focusName(m.focus))
 	sb2 := fmt.Sprintf("svc=%s type=%s regions=%s", m.selectedService, m.selectedType, fs.Regions)
+	if m.auditOpen {
+		sb2 = fmt.Sprintf("audit regions=%s", strings.Join(m.selectedAuditRegions(), ","))
+		if strings.TrimSpace(m.auditFilter.Value()) != "" {
+			sb2 += " filter=" + strings.TrimSpace(m.auditFilter.Value())
+		}
+	}
 	if fs.Resource != "" {
 		sb2 += " filter=" + fs.Resource
 	}
@@ -1435,6 +2491,283 @@ func (m model) View() string {
 	lines = append(lines, row)
 	lines = append(lines, m.statusbar.View())
 	return strings.Join(lines, "\n")
+}
+
+func (m model) auditFullScreenView() string {
+	headerStyle := m.styles.Title
+	metaW := m.paneRightW
+	if metaW <= 0 {
+		metaW = max(44, min(72, m.width/2))
+	}
+	top := m.topBar(headerStyle, metaW)
+
+	filterVal := "(press /)"
+	if m.focus == focusAuditFilter {
+		filterVal = m.auditFilter.View()
+	} else if v := strings.TrimSpace(m.auditFilter.Value()); v != "" {
+		filterVal = v
+	}
+	filterLine := fmt.Sprintf("audit: %s", filterVal)
+
+	body := ""
+	if m.showHelp {
+		body = m.helpModalView()
+	} else if m.auditFacetOpen {
+		body = m.auditFacetsModalView()
+	} else if m.auditMode == auditModeDetail {
+		body = m.auditDetailFullView()
+	} else {
+		body = m.auditListView()
+	}
+
+	status := ""
+	if m.auditLoading {
+		status = "loading audit events..."
+	} else if m.auditDetailError != nil {
+		status = "audit error: " + m.auditDetailError.Error()
+	} else if m.statusLine != "" {
+		status = m.statusLine
+	} else if m.auditFacetOpen {
+		status = "audit facets: tab section • space toggle • / search events • enter apply • c clear • esc close"
+	} else if m.auditMode == auditModeDetail {
+		status = "audit detail: J jump to resource • esc back • E close"
+	} else {
+		status = "audit list: enter detail • J jump • / text filter • F facets • T window • e errors • [ ] cursor page • +/- page size"
+	}
+
+	sb1 := "AUDIT | " + map[bool]string{true: "detail", false: "list"}[m.auditMode == auditModeDetail]
+	sb2 := "regions=" + strings.Join(m.selectedAuditRegions(), ",")
+	if strings.TrimSpace(m.auditFilter.Value()) != "" {
+		sb2 += " filter=" + strings.TrimSpace(m.auditFilter.Value())
+	}
+	sb3 := "E close • enter detail • J jump • F facets • / filter • T window • e errors • +/- page size • [ prev ] next"
+	sb4 := status
+	m.statusbar.SetContent(sb1, sb2, sb3, sb4)
+
+	return strings.Join([]string{top, filterLine, body, m.statusbar.View()}, "\n")
+}
+
+func (m model) auditListView() string {
+	head := "Audit Events"
+	pageLabel := fmt.Sprintf("page %d", max(1, m.auditPageNum))
+	if m.auditTotal > 0 {
+		pageLabel = fmt.Sprintf("page %d (~%d)", max(1, m.auditPageNum), m.auditTotal)
+	}
+	window := normalizeAuditWindow(m.auditFilters.Window)
+	prevState := "off"
+	if m.auditHasPrev {
+		prevState = "on"
+	}
+	nextState := "off"
+	if m.auditHasNext {
+		nextState = "on"
+	}
+	head = fmt.Sprintf(
+		"%s  %s  %s  %s  %s",
+		head,
+		m.styles.Dim.Render(pageLabel),
+		m.styles.Dim.Render("window:"+window),
+		m.styles.Dim.Render(fmt.Sprintf("size:%d", m.auditPageSize)),
+		m.styles.Dim.Render(fmt.Sprintf("cursor:[%s ]%s", prevState, nextState)),
+	)
+	keysLine := "keys: j/k pgup/pgdown ctrl+u/d g/G | [ prev ] next | / text | F facets | T window | e errors | +/- size"
+
+	body := m.auditTable.View()
+	if m.auditLoading {
+		body = m.styles.Dim.Render("loading audit events...") + "\n" + body
+	} else if m.auditDetailError != nil {
+		body = m.styles.Bad.Render("audit load error: "+m.auditDetailError.Error()) + "\n" + body
+	}
+	chips := strings.Join(m.auditActiveChips(), "  ")
+
+	box := m.styles.PaneBorder
+	if m.focus == focusAudit || m.focus == focusAuditFilter {
+		box = m.styles.PaneBorderFocus
+	}
+	if m.width > 0 {
+		box = box.Width(max(10, m.width-2))
+	}
+	lines := []string{
+		m.styles.Title.Render(head),
+		m.styles.Dim.Render(keysLine),
+	}
+	if strings.TrimSpace(chips) != "" {
+		lines = append(lines, chips)
+	}
+	lines = append(lines, body)
+	return box.Render(strings.Join(lines, "\n"))
+}
+
+func (m model) auditActiveChips() []string {
+	chips := []string{}
+	if acts := sortedTrueKeys(m.auditFilters.Actions); len(acts) > 0 {
+		chips = append(chips, m.styles.Value.Render("action:"+strings.Join(acts, "+")))
+	}
+	if svcs := sortedTrueKeys(m.auditFilters.Services); len(svcs) > 0 {
+		if len(svcs) > 3 {
+			chips = append(chips, m.styles.Value.Render(fmt.Sprintf("svc:%s+%d", strings.Join(svcs[:2], "+"), len(svcs)-2)))
+		} else {
+			chips = append(chips, m.styles.Value.Render("svc:"+strings.Join(svcs, "+")))
+		}
+	}
+	if evs := sortedTrueKeys(m.auditFilters.EventNames); len(evs) > 0 {
+		if len(evs) > 2 {
+			chips = append(chips, m.styles.Value.Render(fmt.Sprintf("event:%s+%d", evs[0], len(evs)-1)))
+		} else {
+			chips = append(chips, m.styles.Value.Render("event:"+strings.Join(evs, "+")))
+		}
+	}
+	if m.auditFilters.OnlyErrors {
+		chips = append(chips, m.styles.Bad.Render("errors:on"))
+	}
+	if txt := strings.TrimSpace(m.auditFilters.Text); txt != "" {
+		chips = append(chips, m.styles.Value.Render("q:"+txt))
+	}
+	return chips
+}
+
+func (m model) auditFacetsModalView() string {
+	width := max(60, m.width-6)
+	if m.width <= 0 {
+		width = 100
+	}
+	sel := func(on bool, text string) string {
+		if on {
+			return m.styles.Selected.Render(text)
+		}
+		return m.styles.Value.Render(text)
+	}
+	rowPrefix := func(on bool) string {
+		if on {
+			return "[x]"
+		}
+		return "[ ]"
+	}
+	actions := []string{
+		fmt.Sprintf("%s create", rowPrefix(m.auditFacetDraft.Actions["create"])),
+		fmt.Sprintf("%s delete", rowPrefix(m.auditFacetDraft.Actions["delete"])),
+	}
+	for i := range actions {
+		actions[i] = sel(m.auditFacetSection == 0 && i == m.auditFacetActionsCursor, actions[i])
+	}
+	actionBox := m.styles.PaneBorder.Render(
+		m.styles.Title.Render("Action") + "\n" + strings.Join(actions, "\n"),
+	)
+
+	services := make([]string, 0, len(m.auditFacets.Services))
+	for i, fc := range m.auditFacets.Services {
+		line := fmt.Sprintf("%s %-20s %5d", rowPrefix(m.auditFacetDraft.Services[fc.Value]), fc.Value, fc.Count)
+		services = append(services, sel(m.auditFacetSection == 1 && i == m.auditFacetServicesCursor, line))
+	}
+	if len(services) == 0 {
+		services = append(services, m.styles.Dim.Render("(none)"))
+	}
+	serviceBox := m.styles.PaneBorder.Render(
+		m.styles.Title.Render("Service") + "\n" + strings.Join(services, "\n"),
+	)
+
+	eventHeader := m.styles.Title.Render("Event Type")
+	if m.auditFacetEventSearchOn {
+		eventHeader += " " + m.styles.Dim.Render("(search)")
+	}
+	searchLine := m.styles.Dim.Render("search: (press /)")
+	if m.auditFacetEventSearchOn {
+		searchLine = "search: " + m.auditFacetEventSearch.View()
+	} else if v := strings.TrimSpace(m.auditFacetEventSearch.Value()); v != "" {
+		searchLine = "search: " + v
+	}
+	eventBox := m.styles.PaneBorder.Render(
+		eventHeader + "\n" + searchLine + "\n" + m.auditFacetEventNamePicker.View(),
+	)
+
+	topLine := m.styles.Title.Render("Audit Facets") + " " + m.styles.Dim.Render("tab section • space toggle • / search events • e errors-only • enter apply • c clear • esc close")
+	onlyErr := m.styles.Dim.Render("errors-only: off")
+	if m.auditFacetDraft.OnlyErrors {
+		onlyErr = m.styles.Bad.Render("errors-only: on")
+	}
+
+	colW := max(18, (width-8)/3)
+	actionBox = lipgloss.NewStyle().Width(colW).Render(actionBox)
+	serviceBox = lipgloss.NewStyle().Width(colW).Render(serviceBox)
+	eventBox = lipgloss.NewStyle().Width(colW + 10).Render(eventBox)
+	body := lipgloss.JoinHorizontal(lipgloss.Top, actionBox, serviceBox, eventBox)
+	container := m.styles.PaneBorderFocus
+	if m.width > 0 {
+		container = container.Width(max(20, m.width-2))
+	}
+	return container.Render(topLine + "\n" + onlyErr + "\n" + body)
+}
+
+func (m model) auditDetailFullView() string {
+	outer := m.styles.PaneBorder
+	if m.width > 0 {
+		outer = outer.Width(max(10, m.width-2))
+	}
+
+	if m.auditDetailError != nil {
+		return outer.Render(m.styles.Title.Render("Audit Detail") + "\n" + m.styles.Bad.Render(m.auditDetailError.Error()))
+	}
+	if m.auditDetail == nil {
+		return outer.Render(m.styles.Title.Render("Audit Detail") + "\n" + m.styles.Dim.Render("(loading event detail...)"))
+	}
+
+	row := m.auditDetail
+	lbl := func(k string) string { return m.styles.Label.Render(k) }
+	val := func(v string) string { return m.styles.Value.Render(v) }
+	kv := func(k, v string) string {
+		if !strings.HasSuffix(k, ":") {
+			k += ":"
+		}
+		return lbl(k) + " " + val(v)
+	}
+	actionStyle := m.styles.Dim
+	switch strings.ToLower(strings.TrimSpace(row.Action)) {
+	case "create":
+		actionStyle = m.styles.Good
+	case "delete":
+		actionStyle = m.styles.Bad
+	}
+
+	summary := []string{
+		kv("time", row.EventTime.UTC().Format("2006-01-02 15:04:05")),
+		lbl("action:") + " " + actionStyle.Render(strings.ToUpper(row.Action)),
+		kv("service", row.Service),
+		kv("event", row.EventName),
+		kv("region", row.Region),
+	}
+	resource := firstNonEmpty(strings.TrimSpace(row.ResourceName), strings.TrimSpace(row.ResourceArn), strings.TrimSpace(row.ResourceType), "-")
+	summary = append(summary, kv("resource", resource))
+	actor := firstNonEmpty(strings.TrimSpace(row.Username), strings.TrimSpace(row.PrincipalArn), "-")
+	summary = append(summary, kv("actor", actor))
+	if strings.TrimSpace(string(row.ResourceKey)) != "" {
+		summary = append(summary, m.styles.Dim.Render("J: jump to resource"))
+	} else {
+		summary = append(summary, m.styles.Dim.Render("resource not in inventory"))
+	}
+	if row.ErrorCode != "" || row.ErrorMessage != "" {
+		errLine := row.ErrorCode
+		if errLine == "" {
+			errLine = row.ErrorMessage
+		} else if row.ErrorMessage != "" {
+			errLine += " - " + row.ErrorMessage
+		}
+		summary = append(summary, m.styles.Bad.Render("error: "+errLine))
+	}
+	summaryBox := outer.Render(m.styles.Title.Render("Audit Event") + "\n" + strings.Join(summary, "\n"))
+
+	payloadBox := outer.Render(
+		m.styles.Title.Render("Event Payload") + " " + m.styles.Dim.Render("(j/k/pgup/pgdown/g/G scroll, esc back)") + "\n" + m.auditDetailViewport.View(),
+	)
+	if m.width >= 150 {
+		leftW := max(36, m.width/3)
+		rightW := max(60, m.width-leftW-6)
+		left := outer.Width(max(10, leftW-2)).Render(m.styles.Title.Render("Audit Event") + "\n" + strings.Join(summary, "\n"))
+		right := outer.Width(max(10, rightW-2)).Render(
+			m.styles.Title.Render("Event Payload") + " " + m.styles.Dim.Render("(j/k/pgup/pgdown/g/G scroll, esc back)") + "\n" + m.auditDetailViewport.View(),
+		)
+		return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, summaryBox, payloadBox)
 }
 
 func focusName(f focus) string {
@@ -1453,6 +2786,12 @@ func focusName(f focus) string {
 		return "actions"
 	case focusConfirm:
 		return "confirm"
+	case focusAudit:
+		return "audit"
+	case focusAuditFilter:
+		return "audit-filter"
+	case focusAuditFacets:
+		return "audit-facets"
 	default:
 		return "unknown"
 	}
@@ -1496,7 +2835,9 @@ func (m model) topBar(headerStyle lipgloss.Style, metaOuterW int) string {
 		}
 	}
 	mode := "LIST"
-	if m.graphMode {
+	if m.auditOpen {
+		mode = "AUDIT"
+	} else if m.graphMode {
 		mode = "GRAPH"
 	}
 	fs := m.filters()
@@ -1505,11 +2846,18 @@ func (m model) topBar(headerStyle lipgloss.Style, metaOuterW int) string {
 		filter = "-"
 	}
 	page := "-"
-	if !m.graphMode {
+	if m.auditOpen {
+		page = fmt.Sprintf("%d/%d", max(1, m.auditPageNum), max(1, m.auditPager.TotalPages))
+	} else if !m.graphMode {
 		page = fmt.Sprintf("%d/%d", m.pager.Page+1, max(1, m.pager.TotalPages))
 	}
 	selected := "-"
-	if m.graphMode {
+	if m.auditOpen {
+		if ev, ok := m.selectedAuditEvent(); ok {
+			res := firstNonEmpty(strings.TrimSpace(ev.ResourceName), strings.TrimSpace(ev.ResourceArn), strings.TrimSpace(ev.ResourceType), "-")
+			selected = fmt.Sprintf("%s [%s %s]", ev.EventName, ev.Service, res)
+		}
+	} else if m.graphMode {
 		if sel := m.lens.Selected(); sel.Kind == graphlens.SelectionNeighbor && sel.Neighbor.OtherKey != "" {
 			name := strings.TrimSpace(sel.Neighbor.DisplayName)
 			if name == "" {
@@ -1672,6 +3020,14 @@ func (m model) selectedSummary() (store.ResourceSummary, bool) {
 	return m.resourceSummaries[i], true
 }
 
+func (m model) selectedAuditEvent() (store.CloudTrailEventSummary, bool) {
+	i := m.auditTable.Cursor()
+	if i < 0 || i >= len(m.auditEvents) {
+		return store.CloudTrailEventSummary{}, false
+	}
+	return m.auditEvents[i], true
+}
+
 type selection struct {
 	Key         graph.ResourceKey
 	DisplayName string
@@ -1796,6 +3152,7 @@ func (m model) detailsView() string {
 			val("?: help"),
 			val("R: regions"),
 			val("A: actions"),
+			val("E: audit events"),
 			val("[ ]: prev/next page"),
 			val("backspace: back"),
 			val("ctrl+r: refresh"),
@@ -1970,6 +3327,93 @@ func (m model) detailsView() string {
 		lines = append(lines, "")
 		lines = append(lines, kv("nav depth", fmt.Sprintf("%d (backspace to go back)", len(m.navStack))))
 	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) auditDetailsView() string {
+	lbl := func(k string) string { return m.styles.Label.Render(k) }
+	val := func(v string) string { return m.styles.Value.Render(v) }
+	sec := func(s string) string { return m.styles.Title.Render(s) }
+	kv := func(k, v string) string {
+		if !strings.HasSuffix(k, ":") {
+			k += ":"
+		}
+		return lbl(k) + " " + val(v)
+	}
+	if m.auditDetailError != nil {
+		return sec("audit error") + "\n" + m.styles.Bad.Render(m.auditDetailError.Error())
+	}
+	if m.auditDetail == nil {
+		return sec("audit event") + "\n" + m.styles.Dim.Render("(select an event)")
+	}
+
+	row := m.auditDetail
+	actionStyle := m.styles.Dim
+	switch strings.ToLower(strings.TrimSpace(row.Action)) {
+	case "create":
+		actionStyle = m.styles.Good
+	case "delete":
+		actionStyle = m.styles.Bad
+	}
+
+	lines := []string{
+		sec("summary:"),
+		kv("time", row.EventTime.UTC().Format("2006-01-02 15:04:05")),
+		lbl("action:") + " " + actionStyle.Render(strings.ToUpper(row.Action)),
+		kv("service", row.Service),
+		kv("event", row.EventName),
+		kv("region", row.Region),
+	}
+	if row.ResourceType != "" || row.ResourceName != "" || row.ResourceArn != "" {
+		lines = append(lines, "")
+		lines = append(lines, sec("resource:"))
+		if row.ResourceType != "" {
+			lines = append(lines, kv("type", row.ResourceType))
+		}
+		if row.ResourceName != "" {
+			lines = append(lines, kv("name", row.ResourceName))
+		}
+		if row.ResourceArn != "" {
+			lines = append(lines, kv("arn", row.ResourceArn))
+		}
+		if strings.TrimSpace(string(row.ResourceKey)) != "" {
+			lines = append(lines, kv("resource_key", string(row.ResourceKey)))
+			lines = append(lines, m.styles.Dim.Render("J: jump to resource"))
+		} else {
+			lines = append(lines, m.styles.Dim.Render("resource not in inventory"))
+		}
+	}
+
+	lines = append(lines, "")
+	lines = append(lines, sec("actor:"))
+	if row.Username != "" {
+		lines = append(lines, kv("username", row.Username))
+	}
+	if row.PrincipalArn != "" {
+		lines = append(lines, kv("principal", row.PrincipalArn))
+	}
+	if row.SourceIP != "" {
+		lines = append(lines, kv("source_ip", row.SourceIP))
+	}
+	if row.UserAgent != "" {
+		lines = append(lines, kv("user_agent", row.UserAgent))
+	}
+	if row.ReadOnly != "" {
+		lines = append(lines, kv("read_only", row.ReadOnly))
+	}
+	if row.ErrorCode != "" || row.ErrorMessage != "" {
+		lines = append(lines, "")
+		lines = append(lines, sec("error:"))
+		if row.ErrorCode != "" {
+			lines = append(lines, kv("code", row.ErrorCode))
+		}
+		if row.ErrorMessage != "" {
+			lines = append(lines, kv("message", row.ErrorMessage))
+		}
+	}
+	lines = append(lines, "")
+	lines = append(lines, sec("event json:"))
+	lines = append(lines, m.styles.Dim.Render(strings.TrimSpace(string(row.EventJSON))))
 	return strings.Join(lines, "\n")
 }
 
@@ -2154,6 +3598,207 @@ func (m model) loadNeighborsCmd() tea.Cmd {
 			return neighborsLoadedMsg{key: key, err: err}
 		}
 		return neighborsLoadedMsg{key: key, neighbors: neighbors}
+	}
+}
+
+func normalizeAuditWindow(window string) string {
+	switch strings.ToLower(strings.TrimSpace(window)) {
+	case "24h":
+		return "24h"
+	case "7d":
+		return "7d"
+	case "30d":
+		return "30d"
+	case "all":
+		return "all"
+	default:
+		return "7d"
+	}
+}
+
+func (m model) auditWindowBounds() (*time.Time, *time.Time) {
+	now := time.Now().UTC()
+	until := now
+	switch normalizeAuditWindow(m.auditFilters.Window) {
+	case "24h":
+		s := now.Add(-24 * time.Hour)
+		return &s, &until
+	case "7d":
+		s := now.Add(-7 * 24 * time.Hour)
+		return &s, &until
+	case "30d":
+		s := now.Add(-30 * 24 * time.Hour)
+		return &s, &until
+	default:
+		return nil, nil
+	}
+}
+
+func sortedTrueKeys(mv map[string]bool) []string {
+	if len(mv) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(mv))
+	for k, on := range mv {
+		if on {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (m model) auditQuery() store.CloudTrailEventQuery {
+	since, until := m.auditWindowBounds()
+	limit := m.auditPageSize
+	if limit <= 0 {
+		limit = 100
+	}
+	return store.CloudTrailEventQuery{
+		Regions:    m.selectedAuditRegions(),
+		Text:       strings.TrimSpace(m.auditFilters.Text),
+		Actions:    sortedTrueKeys(m.auditFilters.Actions),
+		Services:   sortedTrueKeys(m.auditFilters.Services),
+		EventNames: sortedTrueKeys(m.auditFilters.EventNames),
+		Since:      since,
+		Until:      until,
+		OnlyErrors: m.auditFilters.OnlyErrors,
+		Limit:      limit,
+	}
+}
+
+func auditCursorToken(c *store.CloudTrailCursor) string {
+	if c == nil {
+		return "-"
+	}
+	return strings.TrimSpace(c.EventTime) + "|" + strings.TrimSpace(c.EventID)
+}
+
+func (m model) auditSignature(q store.CloudTrailEventQuery) string {
+	parts := []string{
+		"r=" + strings.Join(q.Regions, ","),
+		"t=" + q.Text,
+		"a=" + strings.Join(q.Actions, ","),
+		"s=" + strings.Join(q.Services, ","),
+		"e=" + strings.Join(q.EventNames, ","),
+		fmt.Sprintf("err=%t", q.OnlyErrors),
+		fmt.Sprintf("l=%d", q.Limit),
+	}
+	if q.Since != nil {
+		parts = append(parts, "since="+q.Since.UTC().Format(time.RFC3339Nano))
+	}
+	if q.Until != nil {
+		parts = append(parts, "until="+q.Until.UTC().Format(time.RFC3339Nano))
+	}
+	return strings.Join(parts, ";")
+}
+
+func (m model) auditPageCacheKey(q store.CloudTrailEventQuery, pageNum int, after, before *store.CloudTrailCursor) string {
+	return m.auditSignature(q) + fmt.Sprintf("|p=%d|after=%s|before=%s", pageNum, auditCursorToken(after), auditCursorToken(before))
+}
+
+func (m model) loadAuditPageCmd(seq int, pageNum int, after, before *store.CloudTrailCursor) tea.Cmd {
+	q := m.auditQuery()
+	cacheKey := m.auditPageCacheKey(q, pageNum, after, before)
+	if page, ok := m.auditPageCache[cacheKey]; ok {
+		return func() tea.Msg {
+			return auditCursorPageLoadedMsg{
+				seq:       seq,
+				cacheKey:  cacheKey,
+				page:      page,
+				pageNum:   pageNum,
+				fromCache: true,
+			}
+		}
+	}
+	return func() tea.Msg {
+		if strings.TrimSpace(m.accountID) == "" {
+			return auditCursorPageLoadedMsg{
+				seq:      seq,
+				cacheKey: cacheKey,
+				pageNum:  pageNum,
+				page:     store.CloudTrailCursorPage{},
+			}
+		}
+		page, err := m.st.ListCloudTrailEventsByCursor(m.ctx, m.accountID, q, after, before)
+		if err != nil {
+			return auditCursorPageLoadedMsg{seq: seq, cacheKey: cacheKey, pageNum: pageNum, err: err}
+		}
+		return auditCursorPageLoadedMsg{seq: seq, cacheKey: cacheKey, pageNum: pageNum, page: page}
+	}
+}
+
+func (m model) loadAuditFirstPageCmd(seq int) tea.Cmd {
+	return m.loadAuditPageCmd(seq, 1, nil, nil)
+}
+
+func (m model) loadAuditNextPageCmd(seq int) tea.Cmd {
+	if m.auditNextCursor == nil {
+		return nil
+	}
+	next := m.auditPageNum + 1
+	if next <= 0 {
+		next = 2
+	}
+	return m.loadAuditPageCmd(seq, next, m.auditNextCursor, nil)
+}
+
+func (m model) loadAuditPrevPageCmd(seq int) tea.Cmd {
+	if m.auditPrevCursor == nil {
+		return nil
+	}
+	prev := m.auditPageNum - 1
+	if prev < 1 {
+		prev = 1
+	}
+	return m.loadAuditPageCmd(seq, prev, nil, m.auditPrevCursor)
+}
+
+func (m model) loadAuditCountCmd(seq int) tea.Cmd {
+	q := m.auditQuery()
+	return func() tea.Msg {
+		if strings.TrimSpace(m.accountID) == "" {
+			return auditCountLoadedMsg{seq: seq, total: 0}
+		}
+		total, err := m.st.CountCloudTrailEventsByQuery(m.ctx, m.accountID, q)
+		return auditCountLoadedMsg{seq: seq, total: total, err: err}
+	}
+}
+
+func (m model) loadAuditFacetsCmd(seq int) tea.Cmd {
+	q := m.auditQuery()
+	return func() tea.Msg {
+		if strings.TrimSpace(m.accountID) == "" {
+			return auditFacetsLoadedMsg{seq: seq, facets: store.CloudTrailFacets{}}
+		}
+		f, err := m.st.ListCloudTrailEventFacets(m.ctx, m.accountID, q, 200)
+		return auditFacetsLoadedMsg{seq: seq, facets: f, err: err}
+	}
+}
+
+// Legacy compatibility shim for older call-sites while audit commands migrate.
+func (m model) loadAuditEventsCmd() tea.Cmd {
+	seq := m.auditQuerySeq
+	if seq <= 0 {
+		seq = 1
+	}
+	return tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq))
+}
+
+func (m model) loadAuditDetailCmd(eventID string) tea.Cmd {
+	eventID = strings.TrimSpace(eventID)
+	if eventID == "" {
+		return nil
+	}
+	return func() tea.Msg {
+		if strings.TrimSpace(m.accountID) == "" {
+			return auditDetailLoadedMsg{found: false}
+		}
+		row, ok, err := m.st.GetCloudTrailEventByID(m.ctx, m.accountID, eventID)
+		if err != nil {
+			return auditDetailLoadedMsg{err: err}
+		}
+		return auditDetailLoadedMsg{event: row, found: ok}
 	}
 }
 
@@ -2373,6 +4018,12 @@ func (m model) helpModalView() string {
 		"  s: summary",
 		"  r: related",
 		"  x: raw",
+		"",
+		"Audit (E):",
+		"  full-screen create/delete events (last 7d, indexed by scan)",
+		"  /: text filter | F: facets | T: window | e: errors-only",
+		"  [ ]: cursor page | +/-: page size | enter: detail | J: jump to resource",
+		"  esc: detail->list, list->close",
 		"",
 		"Graph Lens (g):",
 		"  h/l or left/right: focus incoming/outgoing",
@@ -2881,6 +4532,31 @@ func (m model) selectedRegionSlice() []string {
 	return out
 }
 
+func (m model) selectedAuditRegions() []string {
+	out := make([]string, 0, len(m.selectedRegions))
+	for r, on := range m.selectedRegions {
+		if on && r != "" && r != "global" {
+			out = append(out, r)
+		}
+	}
+	if len(out) == 0 {
+		for _, r := range m.selectedRegionSlice() {
+			if r != "global" {
+				out = append(out, r)
+			}
+		}
+	}
+	if len(out) == 0 {
+		for _, r := range m.knownRegions {
+			if r != "global" {
+				out = append(out, r)
+			}
+		}
+	}
+	sort.Strings(out)
+	return dedupeStrings(out)
+}
+
 func buildResourceColumns(width int, includeCost bool, includeStored bool, includeIAMKeyFields bool) []table.Column {
 	// Reserve widths for non-name fields; name gets the remainder.
 	if width <= 0 {
@@ -2933,6 +4609,89 @@ func buildResourceColumns(width int, includeCost bool, includeStored bool, inclu
 		table.Column{Title: "ID", Width: idW},
 	)
 	return cols
+}
+
+func buildAuditColumns(width int) []table.Column {
+	if width <= 0 {
+		width = 100
+	}
+	timeW := 19
+	ageW := 7
+	actionW := 7
+	serviceW := 12
+	eventW := 20
+	regionW := 11
+	actorW := 14
+	sep := 8
+	fixed := timeW + ageW + actionW + serviceW + eventW + regionW + actorW + sep
+	resourceW := width - fixed
+	if resourceW < 16 {
+		resourceW = 16
+	}
+	return []table.Column{
+		{Title: "Time", Width: timeW},
+		{Title: "Age", Width: ageW},
+		{Title: "Action", Width: actionW},
+		{Title: "Service", Width: serviceW},
+		{Title: "Event", Width: eventW},
+		{Title: "Resource", Width: resourceW},
+		{Title: "Region", Width: regionW},
+		{Title: "Actor", Width: actorW},
+	}
+}
+
+func ageLabel(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
+	d := time.Since(t)
+	if d < 0 {
+		d = -d
+	}
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	default:
+		return fmt.Sprintf("%dd", int(d.Hours()/24))
+	}
+}
+
+func makeAuditRows(events []store.CloudTrailEventSummary, styles theme.Styles, ic icons.Set) []table.Row {
+	rows := make([]table.Row, 0, len(events))
+	for _, ev := range events {
+		when := ev.EventTime.UTC().Format("2006-01-02 15:04:05")
+		action := strings.ToUpper(strings.TrimSpace(ev.Action))
+		icon := ""
+		if ic != nil {
+			icon = icons.Pad(ic.Status(ev.Action), 2)
+		}
+		switch strings.ToLower(strings.TrimSpace(ev.Action)) {
+		case "create":
+			action = styles.Good.Render(icon + action)
+		case "delete":
+			action = styles.Bad.Render(icon + action)
+		default:
+			action = styles.Dim.Render(icon + action)
+		}
+
+		resource := firstNonEmpty(strings.TrimSpace(ev.ResourceName), strings.TrimSpace(ev.ResourceArn), strings.TrimSpace(ev.ResourceType), "-")
+		actor := firstNonEmpty(strings.TrimSpace(ev.Username), strings.TrimSpace(ev.PrincipalArn), "-")
+		rows = append(rows, table.Row{
+			styles.Dim.Render(when),
+			styles.Dim.Render(ageLabel(ev.EventTime)),
+			action,
+			ev.Service,
+			ev.EventName,
+			resource,
+			styles.Dim.Render(ev.Region),
+			actor,
+		})
+	}
+	return rows
 }
 
 func makeResourceRows(ss []store.ResourceSummary, includeCost bool, styles theme.Styles, ic icons.Set, includeStored bool, includeIAMKeyFields bool) []table.Row {
@@ -3192,6 +4951,44 @@ func defaultTypeForService(service string) string {
 		return "kms:key"
 	case "secretsmanager":
 		return "secretsmanager:secret"
+	case "autoscaling":
+		return "autoscaling:group"
+	case "sagemaker":
+		return "sagemaker:endpoint"
+	case "identitycenter":
+		return "identitycenter:permission-set"
+	case "cloudtrail":
+		return "cloudtrail:trail"
+	case "config":
+		return "config:recorder"
+	case "guardduty":
+		return "guardduty:detector"
+	case "securityhub":
+		return "securityhub:hub"
+	case "accessanalyzer":
+		return "accessanalyzer:analyzer"
+	case "wafv2":
+		return "wafv2:web-acl"
+	case "acm":
+		return "acm:certificate"
+	case "cloudfront":
+		return "cloudfront:distribution"
+	case "apigateway":
+		return "apigateway:rest-api"
+	case "ecr":
+		return "ecr:repository"
+	case "eks":
+		return "eks:cluster"
+	case "elasticache":
+		return "elasticache:replication-group"
+	case "opensearch":
+		return "opensearch:domain"
+	case "redshift":
+		return "redshift:cluster"
+	case "msk":
+		return "msk:cluster"
+	case "efs":
+		return "efs:file-system"
 	default:
 		return ""
 	}
@@ -3200,7 +4997,7 @@ func defaultTypeForService(service string) string {
 func fallbackTypesForService(service string) []string {
 	switch strings.ToLower(strings.TrimSpace(service)) {
 	case "ec2":
-		return []string{"ec2:instance", "ec2:volume", "ec2:security-group", "ec2:subnet", "ec2:vpc"}
+		return []string{"ec2:instance", "ec2:volume", "ec2:snapshot", "ec2:ami", "ec2:nat-gateway", "ec2:eip", "ec2:network-interface", "ec2:route-table", "ec2:nacl", "ec2:internet-gateway", "ec2:launch-template", "ec2:key-pair", "ec2:placement-group", "ec2:security-group", "ec2:subnet", "ec2:vpc"}
 	case "ecs":
 		return []string{"ecs:service", "ecs:cluster", "ecs:task", "ecs:task-definition"}
 	case "elbv2":
@@ -3225,6 +5022,44 @@ func fallbackTypesForService(service string) []string {
 		return []string{"secretsmanager:secret"}
 	case "logs":
 		return []string{"logs:log-group"}
+	case "autoscaling":
+		return []string{"autoscaling:group", "autoscaling:launch-configuration", "autoscaling:instance"}
+	case "sagemaker":
+		return []string{"sagemaker:endpoint", "sagemaker:endpoint-config", "sagemaker:model", "sagemaker:notebook-instance", "sagemaker:training-job", "sagemaker:processing-job", "sagemaker:transform-job", "sagemaker:domain", "sagemaker:user-profile"}
+	case "identitycenter":
+		return []string{"identitycenter:permission-set", "identitycenter:assignment", "identitycenter:user", "identitycenter:group", "identitycenter:instance"}
+	case "cloudtrail":
+		return []string{"cloudtrail:trail"}
+	case "config":
+		return []string{"config:recorder", "config:delivery-channel"}
+	case "guardduty":
+		return []string{"guardduty:detector"}
+	case "securityhub":
+		return []string{"securityhub:hub", "securityhub:standard-subscription"}
+	case "accessanalyzer":
+		return []string{"accessanalyzer:analyzer"}
+	case "wafv2":
+		return []string{"wafv2:web-acl"}
+	case "acm":
+		return []string{"acm:certificate"}
+	case "cloudfront":
+		return []string{"cloudfront:distribution"}
+	case "apigateway":
+		return []string{"apigateway:rest-api", "apigateway:domain-name"}
+	case "ecr":
+		return []string{"ecr:repository"}
+	case "eks":
+		return []string{"eks:cluster", "eks:nodegroup"}
+	case "elasticache":
+		return []string{"elasticache:replication-group", "elasticache:cache-cluster", "elasticache:subnet-group"}
+	case "opensearch":
+		return []string{"opensearch:domain"}
+	case "redshift":
+		return []string{"redshift:cluster", "redshift:subnet-group"}
+	case "msk":
+		return []string{"msk:cluster"}
+	case "efs":
+		return []string{"efs:file-system", "efs:mount-target", "efs:access-point"}
 	default:
 		if t := defaultTypeForService(service); t != "" {
 			return []string{t}
@@ -3281,6 +5116,25 @@ func Run(ctx context.Context, st *store.Store, opts Options) error {
 	regionFilter.CharLimit = 80
 	regionFilter.Width = 24
 
+	auditTable := table.New(table.WithColumns(buildAuditColumns(100)), table.WithRows(nil))
+	auditTable.SetStyles(table.DefaultStyles())
+
+	auditFilter := textinput.New()
+	auditFilter.Placeholder = "event/resource/actor"
+	auditFilter.CharLimit = 120
+	auditFilter.Width = 24
+
+	auditFacetSearch := textinput.New()
+	auditFacetSearch.Placeholder = "search event type"
+	auditFacetSearch.CharLimit = 120
+	auditFacetSearch.Width = 24
+
+	auditFacetList := list.New([]list.Item{}, list.NewDefaultDelegate(), 32, 12)
+	auditFacetList.SetShowHelp(false)
+	auditFacetList.SetShowStatusBar(false)
+	auditFacetList.SetFilteringEnabled(false)
+	auditFacetList.Title = ""
+
 	actionsList := list.New([]list.Item{}, list.NewDefaultDelegate(), 30, 10)
 	actionsList.SetShowHelp(false)
 	actionsList.Title = ""
@@ -3312,17 +5166,33 @@ func Run(ctx context.Context, st *store.Store, opts Options) error {
 		regionSvcCounts:  map[string]int{},
 		regionTypeCounts: map[string]int{},
 		regionFilter:     regionFilter,
-		related:          relatedList,
-		raw:              viewport.New(30, 10),
-		actions:          actionsList,
-		confirm:          confirm,
-		selectedService:  selected,
-		selectedType:     selectedType,
-		loading:          true,
-		identityLoading:  !st.Offline(),
-		selectedRegions:  map[string]bool{},
-		pager:            paginator.New(paginator.WithPerPage(50)),
-		help:             help.New(),
+		auditTable:       auditTable,
+		auditMode:        auditModeList,
+		auditFilter:      auditFilter,
+		auditPager:       paginator.New(paginator.WithPerPage(25)),
+		auditPageNum:     1,
+		auditPageSize:    100,
+		auditFilters: auditFilters{
+			Actions:    map[string]bool{},
+			Services:   map[string]bool{},
+			EventNames: map[string]bool{},
+			Window:     "7d",
+		},
+		auditFacetEventSearch:     auditFacetSearch,
+		auditFacetEventNamePicker: auditFacetList,
+		auditPageCache:            map[string]store.CloudTrailCursorPage{},
+		auditDetailViewport:       viewport.New(30, 10),
+		related:                   relatedList,
+		raw:                       viewport.New(30, 10),
+		actions:                   actionsList,
+		confirm:                   confirm,
+		selectedService:           selected,
+		selectedType:              selectedType,
+		loading:                   true,
+		identityLoading:           !st.Offline(),
+		selectedRegions:           map[string]bool{},
+		pager:                     paginator.New(paginator.WithPerPage(50)),
+		help:                      help.New(),
 		keys: keyMap{
 			Quit:          key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 			Focus:         key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "focus next")),
@@ -3332,6 +5202,13 @@ func Run(ctx context.Context, st *store.Store, opts Options) error {
 			Refresh:       key.NewBinding(key.WithKeys("ctrl+r"), key.WithHelp("ctrl+r", "refresh")),
 			Theme:         key.NewBinding(key.WithKeys("T"), key.WithHelp("T", "theme")),
 			Graph:         key.NewBinding(key.WithKeys("g"), key.WithHelp("g", "graph")),
+			Audit:         key.NewBinding(key.WithKeys("E"), key.WithHelp("E", "audit")),
+			AuditDetail:   key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "audit detail")),
+			AuditJump:     key.NewBinding(key.WithKeys("J"), key.WithHelp("J", "audit jump")),
+			AuditFacets:   key.NewBinding(key.WithKeys("F"), key.WithHelp("F", "audit facets")),
+			AuditWindow:   key.NewBinding(key.WithKeys("T"), key.WithHelp("T", "audit window")),
+			AuditErrors:   key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "audit errors")),
+			AuditPage:     key.NewBinding(key.WithKeys("+", "-"), key.WithHelp("+/-", "audit page size")),
 			Pricing:       key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "pricing")),
 			PrevPage:      key.NewBinding(key.WithKeys("["), key.WithHelp("[", "prev page")),
 			NextPage:      key.NewBinding(key.WithKeys("]"), key.WithHelp("]", "next page")),
@@ -3459,6 +5336,36 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func dedupeStrings(in []string) []string {
+	if len(in) <= 1 {
+		return in
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 func computePaneWidths(w int) (left, mid, right int) {

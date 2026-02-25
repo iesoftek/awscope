@@ -5,6 +5,7 @@ type ScanProgressPhase string
 const (
 	PhaseProvider ScanProgressPhase = "provider"
 	PhaseResolver ScanProgressPhase = "resolver"
+	PhaseAudit    ScanProgressPhase = "audit"
 	PhaseCost     ScanProgressPhase = "cost"
 )
 

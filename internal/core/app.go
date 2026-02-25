@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"awscope/internal/audittrail"
 	"awscope/internal/aws"
 	"awscope/internal/cost"
 	"awscope/internal/graph"
@@ -112,6 +115,15 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 	)
 
 	// Total steps: each regional provider counts per region; each global provider counts once.
+	auditRegions := make([]string, 0, len(opts.Regions))
+	for _, r := range opts.Regions {
+		r = strings.TrimSpace(r)
+		if r == "" || strings.EqualFold(r, "global") {
+			continue
+		}
+		auditRegions = append(auditRegions, r)
+	}
+
 	totalSteps := 0
 	for _, pid := range opts.ProviderIDs {
 		p := registry.MustGet(pid)
@@ -122,8 +134,12 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 		}
 	}
 	needsResolver := has(opts.ProviderIDs, "ec2") && has(opts.ProviderIDs, "elbv2")
+	needsAudit := has(opts.ProviderIDs, "cloudtrail") && len(auditRegions) > 0
 	if needsResolver {
 		totalSteps += len(opts.Regions)
+	}
+	if needsAudit {
+		totalSteps += len(auditRegions)
 	}
 	// Cost indexing: one step per scanned provider (service).
 	totalSteps += len(opts.ProviderIDs)
@@ -181,6 +197,63 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 		case "secretsmanager":
 			primaryType = "secretsmanager:secret"
 			sampleLabel = "secrets"
+		case "autoscaling":
+			primaryType = "autoscaling:group"
+			sampleLabel = "groups"
+		case "sagemaker":
+			primaryType = "sagemaker:endpoint"
+			sampleLabel = "endpoints"
+		case "identitycenter":
+			primaryType = "identitycenter:permission-set"
+			sampleLabel = "permission sets"
+		case "cloudtrail":
+			primaryType = "cloudtrail:trail"
+			sampleLabel = "trails"
+		case "config":
+			primaryType = "config:recorder"
+			sampleLabel = "recorders"
+		case "guardduty":
+			primaryType = "guardduty:detector"
+			sampleLabel = "detectors"
+		case "securityhub":
+			primaryType = "securityhub:hub"
+			sampleLabel = "hubs"
+		case "accessanalyzer":
+			primaryType = "accessanalyzer:analyzer"
+			sampleLabel = "analyzers"
+		case "wafv2":
+			primaryType = "wafv2:web-acl"
+			sampleLabel = "web acls"
+		case "acm":
+			primaryType = "acm:certificate"
+			sampleLabel = "certificates"
+		case "cloudfront":
+			primaryType = "cloudfront:distribution"
+			sampleLabel = "distributions"
+		case "apigateway":
+			primaryType = "apigateway:rest-api"
+			sampleLabel = "apis"
+		case "ecr":
+			primaryType = "ecr:repository"
+			sampleLabel = "repositories"
+		case "eks":
+			primaryType = "eks:cluster"
+			sampleLabel = "clusters"
+		case "elasticache":
+			primaryType = "elasticache:replication-group"
+			sampleLabel = "replication groups"
+		case "opensearch":
+			primaryType = "opensearch:domain"
+			sampleLabel = "domains"
+		case "redshift":
+			primaryType = "redshift:cluster"
+			sampleLabel = "clusters"
+		case "msk":
+			primaryType = "msk:cluster"
+			sampleLabel = "clusters"
+		case "efs":
+			primaryType = "efs:file-system"
+			sampleLabel = "filesystems"
 		}
 		if primaryType == "" {
 			return typeCounts, "", 0, nil
@@ -423,7 +496,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 				}
 				res, err := t.run(gctx)
 				if err != nil {
-					if isAccessDenied(err) {
+					if isSkippableStepError(err) {
 						select {
 						case resultsCh <- scanTaskResult{task: t, stepErr: err.Error()}:
 						case <-gctx.Done():
@@ -562,7 +635,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 					}
 					edges, err := resolveInstanceTargetGroups(rctx, cfg, id.Partition, id.AccountID, refs)
 					if err != nil {
-						if isAccessDenied(err) {
+						if isSkippableStepError(err) {
 							// Best-effort skip resolver errors too (rare; depends on permissions).
 							select {
 							case resCh <- resolverResult{region: region, tgs: len(tgs), err: err.Error()}:
@@ -596,6 +669,194 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 		}
 		if rerr != nil {
 			return ScanResult{}, rerr
+		}
+	}
+
+	// CloudTrail audit indexing: create/delete management events for high-impact services.
+	// Best effort for access-denied regions; hard-fail on other errors.
+	if needsAudit {
+		const (
+			auditWindowDays      = 7
+			auditRetentionDays   = 30
+			auditMaxEventsRegion = 1200
+		)
+		windowDays := envIntOr("AWSCOPE_AUDIT_WINDOW_DAYS", auditWindowDays)
+		maxEventsRegion := envIntOr("AWSCOPE_AUDIT_MAX_EVENTS_PER_REGION", auditMaxEventsRegion)
+		maxRegionDuration := envDurationSecondsOr("AWSCOPE_AUDIT_MAX_REGION_DURATION_SEC", 120*time.Second)
+
+		lookupRegions := append([]string{}, auditRegions...)
+		lookupRegions = append(lookupRegions, "global")
+		lookups, err := a.store.ListResourceLookupsByAccountAndRegions(ctx2, id.AccountID, lookupRegions)
+		if err != nil {
+			return ScanResult{}, err
+		}
+
+		indexer := audittrail.NewIndexer(cfg, id.AccountID, id.Partition, lookups, audittrail.Options{
+			WindowDays:         windowDays,
+			MaxEventsPerRegion: maxEventsRegion,
+			MaxRegionDuration:  maxRegionDuration,
+			OnPage: func(p audittrail.PageProgress) {
+				// Heartbeat to avoid "stuck" perception during long CloudTrail pagination.
+				if progress == nil || p.Page%10 != 0 {
+					return
+				}
+				progress(ScanProgressEvent{
+					Phase:          PhaseAudit,
+					ProviderID:     "cloudtrail",
+					Region:         p.Region,
+					Message:        fmt.Sprintf("indexing (src=%s page=%d indexed=%d)", p.Source, p.Page, p.Indexed),
+					TotalSteps:     totalSteps,
+					CompletedSteps: int(atomic.LoadInt32(&committed)),
+					ResourcesSoFar: int(atomic.LoadInt64(&nodesSoFar)),
+					EdgesSoFar:     int(atomic.LoadInt64(&edgesSoFar)),
+				})
+			},
+		})
+
+		type auditResult struct {
+			region    string
+			rows      []store.CloudTrailEventRow
+			summary   audittrail.RegionSummary
+			truncated bool
+			stepErr   string
+		}
+
+		results := make(chan auditResult, len(auditRegions))
+		auditConc := min(4, maxConc)
+		if auditConc <= 0 {
+			auditConc = 1
+		}
+		if auditConc > len(auditRegions) {
+			auditConc = len(auditRegions)
+		}
+
+		ag, actx := errgroup.WithContext(ctx2)
+		regionCh := make(chan string, len(auditRegions))
+		for _, r := range auditRegions {
+			regionCh <- r
+		}
+		close(regionCh)
+
+		for i := 0; i < auditConc; i++ {
+			ag.Go(func() error {
+				for region := range regionCh {
+					if progress != nil {
+						progress(ScanProgressEvent{
+							Phase:          PhaseAudit,
+							ProviderID:     "cloudtrail",
+							Region:         region,
+							Message:        "indexing create/delete management events (7d)",
+							TotalSteps:     totalSteps,
+							CompletedSteps: int(atomic.LoadInt32(&committed)),
+							ResourcesSoFar: int(atomic.LoadInt64(&nodesSoFar)),
+							EdgesSoFar:     int(atomic.LoadInt64(&edgesSoFar)),
+						})
+					}
+
+					regionRes, err := indexer.IndexRegion(actx, region)
+					if err != nil {
+						if audittrail.IsAccessDenied(err) || isEndpointUnavailable(err) {
+							select {
+							case results <- auditResult{region: region, stepErr: err.Error()}:
+							case <-actx.Done():
+								return actx.Err()
+							}
+							continue
+						}
+						cancel()
+						return fmt.Errorf("cloudtrail/%s: %w", region, err)
+					}
+
+					select {
+					case results <- auditResult{
+						region:    region,
+						rows:      regionRes.Rows,
+						summary:   regionRes.Summary,
+						truncated: regionRes.Truncated,
+					}:
+					case <-actx.Done():
+						return actx.Err()
+					}
+				}
+				return nil
+			})
+		}
+
+		aerr := ag.Wait()
+		close(results)
+		if aerr != nil {
+			return ScanResult{}, aerr
+		}
+
+		for rr := range results {
+			stepErr := strings.TrimSpace(rr.stepErr)
+			if stepErr != "" {
+				failures = append(failures, ScanStepFailure{
+					Phase:      PhaseAudit,
+					ProviderID: "cloudtrail",
+					Region:     rr.region,
+					Error:      stepErr,
+				})
+				completed++
+				atomic.StoreInt32(&committed, int32(completed))
+				if progress != nil {
+					progress(ScanProgressEvent{
+						Phase:              PhaseAudit,
+						ProviderID:         "cloudtrail",
+						Region:             rr.region,
+						Message:            "done",
+						TotalSteps:         totalSteps,
+						CompletedSteps:     completed,
+						ResourcesSoFar:     int(atomic.LoadInt64(&nodesSoFar)),
+						EdgesSoFar:         int(atomic.LoadInt64(&edgesSoFar)),
+						StepResourcesAdded: 0,
+						StepEdgesAdded:     0,
+						StepTypeCounts:     map[string]int{},
+						StepError:          stepErr,
+					})
+				}
+				continue
+			}
+
+			if err := a.store.UpsertCloudTrailEvents(ctx2, rr.rows); err != nil {
+				return ScanResult{}, err
+			}
+
+			stepCounts := map[string]int{
+				"create": rr.summary.Create,
+				"delete": rr.summary.Delete,
+				"pages":  rr.summary.Pages,
+			}
+			msg := "done"
+			if rr.truncated {
+				msg = fmt.Sprintf("done (capped at %d events or duration)", maxEventsRegion)
+			}
+
+			completed++
+			atomic.StoreInt32(&committed, int32(completed))
+			if progress != nil {
+				progress(ScanProgressEvent{
+					Phase:              PhaseAudit,
+					ProviderID:         "cloudtrail",
+					Region:             rr.region,
+					Message:            msg,
+					TotalSteps:         totalSteps,
+					CompletedSteps:     completed,
+					ResourcesSoFar:     int(atomic.LoadInt64(&nodesSoFar)),
+					EdgesSoFar:         int(atomic.LoadInt64(&edgesSoFar)),
+					StepResourcesAdded: len(rr.rows),
+					StepEdgesAdded:     0,
+					StepTypeCounts:     stepCounts,
+					StepSampleLabel:    "events",
+					StepSampleTotal:    rr.summary.Indexed,
+					StepSampleItems:    rr.summary.Samples,
+				})
+			}
+		}
+
+		cutoff := time.Now().UTC().AddDate(0, 0, -auditRetentionDays)
+		if _, err := a.store.PruneCloudTrailEventsOlderThan(ctx2, id.AccountID, cutoff); err != nil {
+			return ScanResult{}, err
 		}
 	}
 
@@ -814,6 +1075,34 @@ func min(a, b int) int {
 	return b
 }
 
+func envIntOr(name string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+func envDurationSecondsOr(name string, fallback time.Duration) time.Duration {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return time.Duration(n) * time.Second
+}
+
+func isSkippableStepError(err error) bool {
+	return isAccessDenied(err) || isEndpointUnavailable(err) || isRegionUnsupported(err)
+}
+
 func isAccessDenied(err error) bool {
 	if err == nil {
 		return false
@@ -840,4 +1129,56 @@ func isAccessDenied(err error) bool {
 		return true
 	}
 	return false
+}
+
+func isEndpointUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	var notFound *awsSDK.EndpointNotFoundError
+	if errors.As(err, &notFound) {
+		return true
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(msg, "no such host"):
+		return true
+	case strings.Contains(msg, "endpoint not found"):
+		return true
+	case strings.Contains(msg, "unknown endpoint"):
+		return true
+	case strings.Contains(msg, "could not resolve endpoint"):
+		return true
+	default:
+		return false
+	}
+}
+
+func isRegionUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		code := strings.TrimSpace(strings.ToLower(apiErr.ErrorCode()))
+		switch code {
+		case "unknownoperationexception", "unknownoperation", "unsupportedoperationexception", "unsupportedoperation":
+			return true
+		}
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(msg, "not supported in the called region"):
+		return true
+	case strings.Contains(msg, "is not supported in this region"):
+		return true
+	case strings.Contains(msg, "requested operation is not supported in the called region"):
+		return true
+	default:
+		return false
+	}
 }

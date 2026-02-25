@@ -20,6 +20,11 @@ type ProfileMapping struct {
 	LastUsedAt  time.Time
 }
 
+type AccountMapping struct {
+	AccountID string
+	Partition string
+}
+
 func (s *Store) UpsertAccountSeen(ctx context.Context, accountID, partition string, seenAt time.Time) error {
 	if seenAt.IsZero() {
 		seenAt = time.Now().UTC()
@@ -160,6 +165,62 @@ ORDER BY profile_name ASC
 		out = append(out, ProfileMapping{ProfileName: name, AccountID: accountID.String, LastUsedAt: t})
 	}
 	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) ListAccounts(ctx context.Context) ([]AccountMapping, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT account_id, partition
+FROM accounts
+ORDER BY account_id ASC
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []AccountMapping
+	for rows.Next() {
+		var (
+			accountID string
+			partition sql.NullString
+		)
+		if err := rows.Scan(&accountID, &partition); err != nil {
+			return nil, err
+		}
+		out = append(out, AccountMapping{AccountID: accountID, Partition: partition.String})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out) > 0 {
+		return out, nil
+	}
+
+	// Fallback for DBs that may not have accounts populated yet.
+	rows2, err := s.db.QueryContext(ctx, `
+SELECT DISTINCT account_id, partition
+FROM resources
+ORDER BY account_id ASC
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows2.Close()
+
+	for rows2.Next() {
+		var (
+			accountID string
+			partition sql.NullString
+		)
+		if err := rows2.Scan(&accountID, &partition); err != nil {
+			return nil, err
+		}
+		out = append(out, AccountMapping{AccountID: accountID, Partition: partition.String})
+	}
+	if err := rows2.Err(); err != nil {
 		return nil, err
 	}
 	return out, nil

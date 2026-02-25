@@ -30,4 +30,5 @@ func init() {
 	register("logs:log-group", logsLogGroupEstimator{})
 	register("kms:key", kmsKeyEstimator{})
 	register("secretsmanager:secret", secretsManagerSecretEstimator{})
+	register("efs:file-system", efsFileSystemEstimator{})
 }
