@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"awscope/internal/aws"
 	"awscope/internal/core"
@@ -16,12 +17,19 @@ import (
 
 func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 	var (
-		profile             string
-		regions             string
-		services            string
-		plain               bool
-		concurrency         int
-		resolverConcurrency int
+		profile                      string
+		regions                      string
+		services                     string
+		noCloudTrail                 bool
+		plain                        bool
+		concurrency                  int
+		resolverConcurrency          int
+		auditRegionConcurrency       int
+		auditSourceConcurrency       int
+		auditLookupIntervalMS        int
+		elbv2TargetHealthConcurrency int
+		costConcurrency              int
+		targetSeconds                int
 	)
 	cmd := &cobra.Command{
 		Use:   "scan",
@@ -65,6 +73,19 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 				serviceIDs = registry.ListIDs()
 				sort.Strings(serviceIDs)
 			}
+			if noCloudTrail {
+				filtered := make([]string, 0, len(serviceIDs))
+				for _, sid := range serviceIDs {
+					if sid == "cloudtrail" {
+						continue
+					}
+					filtered = append(filtered, sid)
+				}
+				serviceIDs = filtered
+			}
+			if len(serviceIDs) == 0 {
+				return fmt.Errorf("no services/providers selected after filtering")
+			}
 			// Validate early for a clearer error.
 			for _, sid := range serviceIDs {
 				if _, ok := registry.Get(sid); !ok {
@@ -76,19 +97,31 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 			var res core.ScanResult
 			if plain {
 				res, err = app.Scan(runCtx, core.ScanOptions{
-					Profile:             profile,
-					Regions:             regionList,
-					ProviderIDs:         serviceIDs,
-					MaxConcurrency:      concurrency,
-					ResolverConcurrency: resolverConcurrency,
+					Profile:                      profile,
+					Regions:                      regionList,
+					ProviderIDs:                  serviceIDs,
+					MaxConcurrency:               concurrency,
+					ResolverConcurrency:          resolverConcurrency,
+					AuditRegionConcurrency:       auditRegionConcurrency,
+					AuditSourceConcurrency:       auditSourceConcurrency,
+					AuditLookupInterval:          time.Duration(auditLookupIntervalMS) * time.Millisecond,
+					ELBv2TargetHealthConcurrency: elbv2TargetHealthConcurrency,
+					CostConcurrency:              costConcurrency,
+					TargetDuration:               time.Duration(targetSeconds) * time.Second,
 				})
 			} else {
 				res, err = scanui.Run(runCtx, st, scanui.Options{
-					Profile:             profile,
-					Regions:             regionList,
-					ProviderIDs:         serviceIDs,
-					MaxConcurrency:      concurrency,
-					ResolverConcurrency: resolverConcurrency,
+					Profile:                      profile,
+					Regions:                      regionList,
+					ProviderIDs:                  serviceIDs,
+					MaxConcurrency:               concurrency,
+					ResolverConcurrency:          resolverConcurrency,
+					AuditRegionConcurrency:       auditRegionConcurrency,
+					AuditSourceConcurrency:       auditSourceConcurrency,
+					AuditLookupInterval:          time.Duration(auditLookupIntervalMS) * time.Millisecond,
+					ELBv2TargetHealthConcurrency: elbv2TargetHealthConcurrency,
+					CostConcurrency:              costConcurrency,
+					TargetDuration:               time.Duration(targetSeconds) * time.Second,
 				})
 			}
 			if err != nil {
@@ -98,6 +131,7 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 			fmt.Printf("scan complete: account=%s partition=%s resources=%d edges=%d db=%s\n",
 				res.AccountID, res.Partition, res.Resources, res.Edges, st.DBPath())
 			fmt.Println(formatDetailedScanSummary(res))
+			fmt.Println(formatScanPerformanceSummary(res))
 			if plain && len(res.StepFailures) > 0 {
 				fmt.Printf("errors (%d):\n", len(res.StepFailures))
 				for i, f := range res.StepFailures {
@@ -114,6 +148,7 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&profile, "profile", "", "AWS profile name (uses default chain if empty)")
 	cmd.Flags().StringVar(&regions, "regions", "", "Comma-separated regions to scan (required; supports 'all')")
+	cmd.Flags().BoolVar(&noCloudTrail, "no-cloudtrail", false, "Exclude CloudTrail provider/event indexing from scan")
 	servicesUsage := "Comma-separated service/provider IDs to scan (default: all supported)"
 	if known := registry.ListIDs(); len(known) > 0 {
 		sort.Strings(known)
@@ -121,7 +156,13 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&services, "services", "", servicesUsage)
 	cmd.Flags().BoolVar(&plain, "plain", false, "Disable progress UI and print only the final summary")
-	cmd.Flags().IntVar(&concurrency, "concurrency", 8, "Max concurrent AWS scan tasks")
-	cmd.Flags().IntVar(&resolverConcurrency, "resolver-concurrency", 4, "Max concurrent resolver tasks (ELBv2 membership)")
+	cmd.Flags().IntVar(&concurrency, "concurrency", intEnvOr("AWSCOPE_SCAN_CONCURRENCY", 16), "Max concurrent AWS scan tasks")
+	cmd.Flags().IntVar(&resolverConcurrency, "resolver-concurrency", intEnvOr("AWSCOPE_RESOLVER_CONCURRENCY", 8), "Max concurrent resolver tasks (ELBv2 membership)")
+	cmd.Flags().IntVar(&auditRegionConcurrency, "audit-region-concurrency", intEnvOr("AWSCOPE_AUDIT_REGION_CONCURRENCY", 10), "Max concurrent audit region workers")
+	cmd.Flags().IntVar(&auditSourceConcurrency, "audit-source-concurrency", intEnvOr("AWSCOPE_AUDIT_SOURCE_CONCURRENCY", 3), "Max concurrent CloudTrail event-source workers per region")
+	cmd.Flags().IntVar(&auditLookupIntervalMS, "audit-lookup-interval-ms", intEnvOr("AWSCOPE_AUDIT_LOOKUP_INTERVAL_MS", 0), "Delay between CloudTrail LookupEvents requests in milliseconds (0 disables pacing delay)")
+	cmd.Flags().IntVar(&elbv2TargetHealthConcurrency, "elbv2-targethealth-concurrency", intEnvOr("AWSCOPE_ELBV2_TARGETHEALTH_CONCURRENCY", 30), "Max concurrent ELBv2 target health calls per resolver region")
+	cmd.Flags().IntVar(&costConcurrency, "cost-concurrency", intEnvOr("AWSCOPE_COST_CONCURRENCY", 16), "Max concurrent cost estimation workers")
+	cmd.Flags().IntVar(&targetSeconds, "target-seconds", intEnvOr("AWSCOPE_SCAN_TARGET_SECONDS", 60), "Scan target duration in seconds (reporting only)")
 	return cmd
 }

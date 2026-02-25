@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"awscope/internal/core"
 )
@@ -53,9 +54,65 @@ func TestFormatDetailedScanSummary_EmptySections(t *testing.T) {
 	mustContain(t, out, "unknown resources: 0")
 }
 
+func TestFormatScanPerformanceSummary_Renders(t *testing.T) {
+	res := core.ScanResult{
+		Performance: core.ScanPerformanceSummary{
+			TotalDuration:  92 * time.Second,
+			TargetDuration: 60 * time.Second,
+			TargetMet:      false,
+			PhaseDurations: map[core.ScanProgressPhase]time.Duration{
+				core.PhaseProvider: 18 * time.Second,
+				core.PhaseResolver: 12 * time.Second,
+				core.PhaseAudit:    58 * time.Second,
+				core.PhaseCost:     4 * time.Second,
+			},
+			SlowSteps: []core.ScanSlowStep{
+				{Phase: core.PhaseAudit, ProviderID: "cloudtrail", Region: "us-west-2", Duration: 21 * time.Second},
+			},
+		},
+	}
+
+	out := formatScanPerformanceSummary(res)
+	mustContain(t, out, "performance: total=1m32s target=1m0s (missed by 32s)")
+	mustContain(t, out, "phase provider=18s resolver=12s audit=58s cost=4s")
+	mustContain(t, out, "audit")
+	mustContain(t, out, "cloudtrail")
+}
+
 func mustContain(t *testing.T, s, sub string) {
 	t.Helper()
 	if !strings.Contains(s, sub) {
 		t.Fatalf("expected %q to contain %q", s, sub)
+	}
+}
+
+func TestNewScanCmd_DefaultFlagsAndNoCloudTrail(t *testing.T) {
+	t.Setenv("AWSCOPE_SCAN_CONCURRENCY", "")
+	t.Setenv("AWSCOPE_RESOLVER_CONCURRENCY", "")
+	t.Setenv("AWSCOPE_AUDIT_REGION_CONCURRENCY", "")
+	t.Setenv("AWSCOPE_AUDIT_SOURCE_CONCURRENCY", "")
+	t.Setenv("AWSCOPE_AUDIT_LOOKUP_INTERVAL_MS", "")
+	t.Setenv("AWSCOPE_ELBV2_TARGETHEALTH_CONCURRENCY", "")
+	t.Setenv("AWSCOPE_COST_CONCURRENCY", "")
+	t.Setenv("AWSCOPE_SCAN_TARGET_SECONDS", "")
+
+	dbPath := ""
+	offline := false
+	cmd := newScanCmd(&dbPath, &offline)
+
+	if f := cmd.Flags().Lookup("no-cloudtrail"); f == nil {
+		t.Fatalf("expected --no-cloudtrail flag")
+	}
+	if got := cmd.Flags().Lookup("concurrency").DefValue; got != "16" {
+		t.Fatalf("concurrency default: got %q want %q", got, "16")
+	}
+	if got := cmd.Flags().Lookup("resolver-concurrency").DefValue; got != "8" {
+		t.Fatalf("resolver default: got %q want %q", got, "8")
+	}
+	if got := cmd.Flags().Lookup("elbv2-targethealth-concurrency").DefValue; got != "30" {
+		t.Fatalf("elbv2 default: got %q want %q", got, "30")
+	}
+	if got := cmd.Flags().Lookup("cost-concurrency").DefValue; got != "16" {
+		t.Fatalf("cost default: got %q want %q", got, "16")
 	}
 }

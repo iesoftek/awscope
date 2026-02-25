@@ -5,7 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"awscope/internal/graph"
@@ -75,39 +79,92 @@ func (p *Provider) List(ctx context.Context, cfg awsSDK.Config, req providers.Li
 		return providers.ListResult{}, err
 	}
 
+	type bucketResult struct {
+		node    graph.ResourceNode
+		edges   []graph.RelationshipEdge
+		include bool
+		err     error
+	}
+	results := make([]bucketResult, len(out.Buckets))
+	bucketConc := envIntOr("AWSCOPE_S3_BUCKET_CONCURRENCY", 12)
+	if bucketConc > len(out.Buckets) {
+		bucketConc = len(out.Buckets)
+	}
+	if bucketConc < 1 {
+		bucketConc = 1
+	}
+
+	type job struct {
+		idx int
+		b   types.Bucket
+	}
+	jobs := make(chan job, len(out.Buckets))
+	for i, b := range out.Buckets {
+		jobs <- job{idx: i, b: b}
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for j := range jobs {
+			name := awsToString(j.b.Name)
+			if name == "" {
+				results[j.idx] = bucketResult{}
+				continue
+			}
+			region, err := bucketRegion(ctx, api, name)
+			if err != nil {
+				results[j.idx] = bucketResult{err: err}
+				continue
+			}
+			if !allowed[region] {
+				results[j.idx] = bucketResult{}
+				continue
+			}
+
+			n, es := normalizeBucket(req.Partition, req.AccountID, region, j.b, now)
+			encAttrs, encEdges, _ := bucketEncryption(ctx, api, req.Partition, req.AccountID, region, name, n.Key, now)
+			for k, v := range encAttrs {
+				n.Attributes[k] = v
+			}
+			es = append(es, encEdges...)
+
+			pabAttrs, _ := bucketPublicAccessBlock(ctx, api, name)
+			for k, v := range pabAttrs {
+				n.Attributes[k] = v
+			}
+			results[j.idx] = bucketResult{node: n, edges: es, include: true}
+		}
+	}
+	wg.Add(bucketConc)
+	for i := 0; i < bucketConc; i++ {
+		go worker()
+	}
+	wg.Wait()
+
 	var nodes []graph.ResourceNode
 	var edges []graph.RelationshipEdge
-	for _, b := range out.Buckets {
-		name := awsToString(b.Name)
-		if name == "" {
+	for _, r := range results {
+		if r.err != nil {
+			return providers.ListResult{}, r.err
+		}
+		if !r.include {
 			continue
 		}
-		region, err := bucketRegion(ctx, api, name)
-		if err != nil {
-			return providers.ListResult{}, err
-		}
-		if !allowed[region] {
-			continue
-		}
-
-		n, es := normalizeBucket(req.Partition, req.AccountID, region, b, now)
-		nodes = append(nodes, n)
-		edges = append(edges, es...)
-
-		// Best-effort encryption + public access block posture.
-		encAttrs, encEdges, _ := bucketEncryption(ctx, api, req.Partition, req.AccountID, region, name, n.Key, now)
-		for k, v := range encAttrs {
-			n.Attributes[k] = v
-		}
-		edges = append(edges, encEdges...)
-
-		pabAttrs, _ := bucketPublicAccessBlock(ctx, api, name)
-		for k, v := range pabAttrs {
-			n.Attributes[k] = v
-		}
-		// Update the node with posture details.
-		nodes[len(nodes)-1] = n
+		nodes = append(nodes, r.node)
+		edges = append(edges, r.edges...)
 	}
+	sort.Slice(nodes, func(i, j int) bool { return string(nodes[i].Key) < string(nodes[j].Key) })
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].From != edges[j].From {
+			return string(edges[i].From) < string(edges[j].From)
+		}
+		if edges[i].To != edges[j].To {
+			return string(edges[i].To) < string(edges[j].To)
+		}
+		return edges[i].Kind < edges[j].Kind
+	})
 
 	return providers.ListResult{Nodes: nodes, Edges: edges}, nil
 }
@@ -280,4 +337,16 @@ func awsToString[T ~string](p *T) string {
 		return ""
 	}
 	return string(*p)
+}
+
+func envIntOr(name string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
 }

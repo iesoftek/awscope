@@ -132,13 +132,52 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 		return typeCounts, sampleLabel, sampleTotal, names
 	}
 
+	scanStartedAt := time.Now()
+	phaseDurations := map[ScanProgressPhase]time.Duration{}
+	var slowSteps []ScanSlowStep
+	addSlowStep := func(phase ScanProgressPhase, providerID, region string, d time.Duration) {
+		if d <= 0 {
+			return
+		}
+		slowSteps = append(slowSteps, ScanSlowStep{
+			Phase:      phase,
+			ProviderID: providerID,
+			Region:     region,
+			Duration:   d,
+		})
+	}
+
 	maxConc := opts.MaxConcurrency
 	if maxConc <= 0 {
-		maxConc = 8
+		maxConc = 16
 	}
 	resolverConc := opts.ResolverConcurrency
 	if resolverConc <= 0 {
-		resolverConc = 4
+		resolverConc = 8
+	}
+	auditRegionConc := opts.AuditRegionConcurrency
+	if auditRegionConc <= 0 {
+		auditRegionConc = 10
+	}
+	auditSourceConc := opts.AuditSourceConcurrency
+	if auditSourceConc <= 0 {
+		auditSourceConc = 3
+	}
+	auditLookupInterval := opts.AuditLookupInterval
+	if auditLookupInterval < 0 {
+		auditLookupInterval = 0
+	}
+	elbv2TargetHealthConc := opts.ELBv2TargetHealthConcurrency
+	if elbv2TargetHealthConc <= 0 {
+		elbv2TargetHealthConc = 30
+	}
+	costConc := opts.CostConcurrency
+	if costConc <= 0 {
+		costConc = 16
+	}
+	targetDuration := opts.TargetDuration
+	if targetDuration <= 0 {
+		targetDuration = 60 * time.Second
 	}
 
 	type scanTask struct {
@@ -154,6 +193,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 		task    scanTask
 		res     providers.ListResult
 		stepErr string
+		elapsed time.Duration
 	}
 
 	ctx2, cancel := context.WithCancel(ctx)
@@ -174,6 +214,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 					Region:     r.task.stepRegion,
 					Error:      r.stepErr,
 				})
+				addSlowStep(r.task.phase, r.task.providerID, r.task.stepRegion, r.elapsed)
 				completed++
 				atomic.StoreInt32(&committed, int32(completed))
 				if progress != nil {
@@ -238,19 +279,13 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 
 			// Aggregate TGs for resolver (region derived from node key; ScopeAccount can span regions).
 			if r.task.providerID == "elbv2" {
-				for _, n := range r.res.Nodes {
-					if n.Service != "elbv2" || n.Type != "elbv2:target-group" || n.PrimaryID == "" {
-						continue
-					}
-					_, _, rr, _, _, err := graph.ParseResourceKey(n.Key)
-					if err != nil || rr == "" {
-						continue
-					}
-					tgsByRegion[rr] = append(tgsByRegion[rr], n.PrimaryID)
+				for rr, arns := range collectInstanceTargetGroupsByRegion(r.res.Nodes) {
+					tgsByRegion[rr] = append(tgsByRegion[rr], arns...)
 				}
 			}
 
 			typeCounts, sampleLabel, sampleTotal, sampleItems := stepSummary(r.task.providerID, r.res.Nodes, r.res.Edges)
+			addSlowStep(r.task.phase, r.task.providerID, r.task.stepRegion, r.elapsed)
 			completed++
 			atomic.StoreInt32(&committed, int32(completed))
 
@@ -274,6 +309,8 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 			}
 		}
 	}()
+
+	providerStageStartedAt := time.Now()
 
 	// Build provider tasks.
 	var tasks []scanTask
@@ -364,11 +401,13 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 						EdgesSoFar:     int(atomic.LoadInt64(&edgesSoFar)),
 					})
 				}
+				started := time.Now()
 				res, err := t.run(gctx)
+				elapsed := time.Since(started)
 				if err != nil {
 					if isSkippableStepError(err) {
 						select {
-						case resultsCh <- scanTaskResult{task: t, stepErr: err.Error()}:
+						case resultsCh <- scanTaskResult{task: t, stepErr: err.Error(), elapsed: elapsed}:
 						case <-gctx.Done():
 							return gctx.Err()
 						}
@@ -378,7 +417,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 					return fmt.Errorf("%s/%s: %w", t.providerID, t.stepRegion, err)
 				}
 				select {
-				case resultsCh <- scanTaskResult{task: t, res: res}:
+				case resultsCh <- scanTaskResult{task: t, res: res, elapsed: elapsed}:
 				case <-gctx.Done():
 					return gctx.Err()
 				}
@@ -401,14 +440,21 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 	if workerErr != nil {
 		return ScanResult{}, workerErr
 	}
+	phaseDurations[PhaseProvider] = time.Since(providerStageStartedAt)
 
 	// Resolver: instance -> target group membership (full mapping v1 slice).
 	if needsResolver {
+		resolverStageStartedAt := time.Now()
+		resolveTargetGroups := a.resolveTargetGroups
+		if resolveTargetGroups == nil {
+			resolveTargetGroups = resolveInstanceTargetGroups
+		}
 		type resolverResult struct {
-			region string
-			tgs    int
-			edges  []graph.RelationshipEdge
-			err    string
+			region  string
+			tgs     int
+			edges   []graph.RelationshipEdge
+			err     string
+			elapsed time.Duration
 		}
 
 		resCh := make(chan resolverResult, resolverConc*2)
@@ -425,6 +471,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 						Region:     rr.region,
 						Error:      rr.err,
 					})
+					addSlowStep(PhaseResolver, "elbv2", rr.region, rr.elapsed)
 					completed++
 					atomic.StoreInt32(&committed, int32(completed))
 					if progress != nil {
@@ -455,6 +502,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 					return
 				}
 				atomic.AddInt64(&edgesSoFar, int64(len(rr.edges)))
+				addSlowStep(PhaseResolver, "elbv2", rr.region, rr.elapsed)
 				completed++
 				atomic.StoreInt32(&committed, int32(completed))
 				if progress != nil {
@@ -487,6 +535,22 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 			rg.Go(func() error {
 				for region := range regionCh {
 					tgs := tgsByRegion[region]
+					if len(tgs) > 1 {
+						seen := make(map[string]struct{}, len(tgs))
+						deduped := make([]string, 0, len(tgs))
+						for _, arn := range tgs {
+							arn = strings.TrimSpace(arn)
+							if arn == "" {
+								continue
+							}
+							if _, ok := seen[arn]; ok {
+								continue
+							}
+							seen[arn] = struct{}{}
+							deduped = append(deduped, arn)
+						}
+						tgs = deduped
+					}
 					if progress != nil {
 						progress(ScanProgressEvent{
 							Phase:          PhaseResolver,
@@ -503,12 +567,14 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 					for _, arn := range tgs {
 						refs = append(refs, tgRef{region: region, arn: arn})
 					}
-					edges, err := resolveInstanceTargetGroups(rctx, cfg, id.Partition, id.AccountID, refs)
+					started := time.Now()
+					edges, err := resolveTargetGroups(rctx, cfg, id.Partition, id.AccountID, refs, elbv2TargetHealthConc)
+					elapsed := time.Since(started)
 					if err != nil {
 						if isSkippableStepError(err) {
 							// Best-effort skip resolver errors too (rare; depends on permissions).
 							select {
-							case resCh <- resolverResult{region: region, tgs: len(tgs), err: err.Error()}:
+							case resCh <- resolverResult{region: region, tgs: len(tgs), err: err.Error(), elapsed: elapsed}:
 							case <-rctx.Done():
 								return rctx.Err()
 							}
@@ -518,7 +584,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 						return err
 					}
 					select {
-					case resCh <- resolverResult{region: region, tgs: len(tgs), edges: edges}:
+					case resCh <- resolverResult{region: region, tgs: len(tgs), edges: edges, elapsed: elapsed}:
 					case <-rctx.Done():
 						return rctx.Err()
 					}
@@ -540,11 +606,13 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 		if rerr != nil {
 			return ScanResult{}, rerr
 		}
+		phaseDurations[PhaseResolver] = time.Since(resolverStageStartedAt)
 	}
 
 	// CloudTrail audit indexing: create/delete management events for high-impact services.
 	// Best effort for access-denied regions; hard-fail on other errors.
 	if needsAudit {
+		auditStageStartedAt := time.Now()
 		const (
 			auditWindowDays      = 7
 			auditRetentionDays   = 30
@@ -565,6 +633,8 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 			WindowDays:         windowDays,
 			MaxEventsPerRegion: maxEventsRegion,
 			MaxRegionDuration:  maxRegionDuration,
+			LookupInterval:     auditLookupInterval,
+			SourceConcurrency:  auditSourceConc,
 			OnPage: func(p audittrail.PageProgress) {
 				// Heartbeat to avoid "stuck" perception during long CloudTrail pagination.
 				if progress == nil || p.Page%10 != 0 {
@@ -589,10 +659,11 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 			summary   audittrail.RegionSummary
 			truncated bool
 			stepErr   string
+			elapsed   time.Duration
 		}
 
 		results := make(chan auditResult, len(auditRegions))
-		auditConc := min(4, maxConc)
+		auditConc := auditRegionConc
 		if auditConc <= 0 {
 			auditConc = 1
 		}
@@ -615,7 +686,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 							Phase:          PhaseAudit,
 							ProviderID:     "cloudtrail",
 							Region:         region,
-							Message:        "indexing create/delete management events (7d)",
+							Message:        fmt.Sprintf("indexing create/delete management events (%dd)", windowDays),
 							TotalSteps:     totalSteps,
 							CompletedSteps: int(atomic.LoadInt32(&committed)),
 							ResourcesSoFar: int(atomic.LoadInt64(&nodesSoFar)),
@@ -623,11 +694,13 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 						})
 					}
 
+					started := time.Now()
 					regionRes, err := indexer.IndexRegion(actx, region)
+					elapsed := time.Since(started)
 					if err != nil {
-						if audittrail.IsAccessDenied(err) || isEndpointUnavailable(err) {
+						if audittrail.IsAccessDenied(err) || audittrail.IsThrottled(err) || isEndpointUnavailable(err) {
 							select {
-							case results <- auditResult{region: region, stepErr: err.Error()}:
+							case results <- auditResult{region: region, stepErr: err.Error(), elapsed: elapsed}:
 							case <-actx.Done():
 								return actx.Err()
 							}
@@ -643,6 +716,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 						rows:      regionRes.Rows,
 						summary:   regionRes.Summary,
 						truncated: regionRes.Truncated,
+						elapsed:   elapsed,
 					}:
 					case <-actx.Done():
 						return actx.Err()
@@ -667,6 +741,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 					Region:     rr.region,
 					Error:      stepErr,
 				})
+				addSlowStep(PhaseAudit, "cloudtrail", rr.region, rr.elapsed)
 				completed++
 				atomic.StoreInt32(&committed, int32(completed))
 				if progress != nil {
@@ -703,6 +778,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 			}
 
 			completed++
+			addSlowStep(PhaseAudit, "cloudtrail", rr.region, rr.elapsed)
 			atomic.StoreInt32(&committed, int32(completed))
 			if progress != nil {
 				progress(ScanProgressEvent{
@@ -728,21 +804,18 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 		if _, err := a.store.PruneCloudTrailEventsOlderThan(ctx2, id.AccountID, cutoff); err != nil {
 			return ScanResult{}, err
 		}
+		phaseDurations[PhaseAudit] = time.Since(auditStageStartedAt)
 	}
 
 	// Cost indexing: best-effort estimated monthly cost per resource.
 	// This stage never fails the scan due to Pricing API errors; it records warnings in StepFailures.
 	{
+		costStageStartedAt := time.Now()
 		// Include "global" for providers that emit global resources (e.g. IAM).
 		regionsForCost := append([]string{}, opts.Regions...)
 		regionsForCost = append(regionsForCost, "global")
 
 		pc := pricing.NewClient(a.store, cfg, pricing.Options{})
-
-		costConc := min(8, maxConc)
-		if costConc <= 0 {
-			costConc = 1
-		}
 
 		// If Pricing is denied once, disable further pricing calls and only write unknown rows.
 		var pricingDenied int32
@@ -750,6 +823,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 
 		for _, sid := range opts.ProviderIDs {
 			sid := sid
+			serviceStarted := time.Now()
 			if progress != nil {
 				progress(ScanProgressEvent{
 					Phase:          PhaseCost,
@@ -838,6 +912,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 			}
 
 			completed++
+			addSlowStep(PhaseCost, sid, "all", time.Since(serviceStarted))
 			atomic.StoreInt32(&committed, int32(completed))
 			if progress != nil {
 				progress(ScanProgressEvent{
@@ -864,6 +939,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 				}
 			}
 		}
+		phaseDurations[PhaseCost] = time.Since(costStageStartedAt)
 	}
 
 	summary := ScanSummary{
@@ -976,6 +1052,30 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 		}
 	}
 
+	totalDuration := time.Since(scanStartedAt)
+	sort.Slice(slowSteps, func(i, j int) bool {
+		if slowSteps[i].Duration != slowSteps[j].Duration {
+			return slowSteps[i].Duration > slowSteps[j].Duration
+		}
+		if slowSteps[i].Phase != slowSteps[j].Phase {
+			return slowSteps[i].Phase < slowSteps[j].Phase
+		}
+		if slowSteps[i].ProviderID != slowSteps[j].ProviderID {
+			return slowSteps[i].ProviderID < slowSteps[j].ProviderID
+		}
+		return slowSteps[i].Region < slowSteps[j].Region
+	})
+	if len(slowSteps) > 10 {
+		slowSteps = slowSteps[:10]
+	}
+	perf := ScanPerformanceSummary{
+		TotalDuration:  totalDuration,
+		TargetDuration: targetDuration,
+		TargetMet:      totalDuration <= targetDuration,
+		PhaseDurations: phaseDurations,
+		SlowSteps:      slowSteps,
+	}
+
 	return ScanResult{
 		Resources:    int(atomic.LoadInt64(&nodesSoFar)),
 		Edges:        int(atomic.LoadInt64(&edgesSoFar)),
@@ -983,5 +1083,6 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 		Partition:    id.Partition,
 		StepFailures: failures,
 		Summary:      summary,
+		Performance:  perf,
 	}, nil
 }

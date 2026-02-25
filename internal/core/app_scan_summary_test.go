@@ -197,3 +197,48 @@ func TestScanWithProgress_PricingSummaryFailureIsBestEffort(t *testing.T) {
 		t.Fatalf("expected cost/summary step failure, got %#v", res.StepFailures)
 	}
 }
+
+func TestScanWithProgress_PopulatesPerformanceSummary(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test.sqlite")
+
+	st, err := store.Open(store.OpenOptions{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	app := New(st)
+	app.loader = fakeLoader{id: aws.Identity{AccountID: "123456789012", Partition: "aws", Arn: "arn:aws:sts::123456789012:assumed-role/x/y"}}
+
+	providerID := "summarysvc-perf"
+	if _, ok := registry.Get(providerID); !ok {
+		registry.Register(summaryProvider{id: providerID, perRegionN: 1})
+	}
+
+	res, scanErr := app.ScanWithProgress(ctx, ScanOptions{
+		Profile:        "default",
+		Regions:        []string{"us-east-1"},
+		ProviderIDs:    []string{providerID},
+		TargetDuration: 1 * time.Nanosecond,
+	}, nil)
+	if scanErr != nil {
+		t.Fatalf("scan: %v", scanErr)
+	}
+
+	if res.Performance.TotalDuration <= 0 {
+		t.Fatalf("total duration not set: %#v", res.Performance)
+	}
+	if res.Performance.TargetDuration != 1*time.Nanosecond {
+		t.Fatalf("target duration: got %s want 1ns", res.Performance.TargetDuration)
+	}
+	if res.Performance.TargetMet {
+		t.Fatalf("expected target miss, got target met with %#v", res.Performance)
+	}
+	if len(res.Performance.PhaseDurations) == 0 {
+		t.Fatalf("phase durations not populated: %#v", res.Performance)
+	}
+	if len(res.Performance.SlowSteps) == 0 {
+		t.Fatalf("slow steps not populated: %#v", res.Performance)
+	}
+}

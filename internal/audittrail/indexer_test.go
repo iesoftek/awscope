@@ -2,6 +2,8 @@ package audittrail
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	awsSDK "github.com/aws/aws-sdk-go-v2/aws"
 	sdkcloudtrail "github.com/aws/aws-sdk-go-v2/service/cloudtrail"
 	"github.com/aws/aws-sdk-go-v2/service/cloudtrail/types"
+	"github.com/aws/smithy-go"
 )
 
 type fakeLookupAPI struct {
@@ -114,10 +117,181 @@ func TestIndexer_IndexRegion_FiltersAndResolves(t *testing.T) {
 	if len(res.Rows) != 2 {
 		t.Fatalf("rows len: got %d want 2", len(res.Rows))
 	}
-	if res.Rows[0].EventID != "evt-1" || res.Rows[0].ResourceKey != instanceKey {
-		t.Fatalf("row1 not resolved as expected: %#v", res.Rows[0])
+	rowsByID := map[string]store.CloudTrailEventRow{}
+	for _, row := range res.Rows {
+		rowsByID[row.EventID] = row
 	}
-	if res.Rows[1].EventID != "evt-3" || res.Rows[1].Action != "delete" {
-		t.Fatalf("row2 unexpected: %#v", res.Rows[1])
+	if row := rowsByID["evt-1"]; row.EventID != "evt-1" || row.ResourceKey != instanceKey {
+		t.Fatalf("evt-1 row not resolved as expected: %#v", row)
+	}
+	if row := rowsByID["evt-3"]; row.EventID != "evt-3" || row.Action != "delete" {
+		t.Fatalf("evt-3 row unexpected: %#v", row)
+	}
+}
+
+type concurrentLookupAPI struct {
+	mu       sync.Mutex
+	calls    map[string]int
+	inFlight int32
+	maxSeen  int32
+	barrier  chan struct{}
+	enterN   int32
+}
+
+func (f *concurrentLookupAPI) LookupEvents(ctx context.Context, params *sdkcloudtrail.LookupEventsInput, optFns ...func(*sdkcloudtrail.Options)) (*sdkcloudtrail.LookupEventsOutput, error) {
+	source := ""
+	if len(params.LookupAttributes) == 1 && params.LookupAttributes[0].AttributeValue != nil {
+		source = awsSDK.ToString(params.LookupAttributes[0].AttributeValue)
+	}
+
+	n := atomic.AddInt32(&f.inFlight, 1)
+	for {
+		cur := atomic.LoadInt32(&f.maxSeen)
+		if n <= cur || atomic.CompareAndSwapInt32(&f.maxSeen, cur, n) {
+			break
+		}
+	}
+	defer atomic.AddInt32(&f.inFlight, -1)
+
+	if f.barrier != nil {
+		enter := atomic.AddInt32(&f.enterN, 1)
+		if enter == 2 {
+			close(f.barrier)
+		}
+		if enter <= 2 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-f.barrier:
+			}
+		}
+	}
+
+	f.mu.Lock()
+	if f.calls == nil {
+		f.calls = map[string]int{}
+	}
+	page := f.calls[source]
+	f.calls[source] = page + 1
+	f.mu.Unlock()
+
+	event := func(id, name, source string) types.Event {
+		return types.Event{
+			EventId:     awsSDK.String(id),
+			EventName:   awsSDK.String(name),
+			EventSource: awsSDK.String(source),
+			EventTime:   awsSDK.Time(time.Date(2026, 2, 24, 10, 0, 0, 0, time.UTC)),
+			CloudTrailEvent: awsSDK.String(`{
+  "eventSource":"` + source + `",
+  "eventName":"` + name + `"
+}`),
+		}
+	}
+
+	switch source {
+	case "ec2.amazonaws.com":
+		if page == 0 {
+			return &sdkcloudtrail.LookupEventsOutput{
+				Events:    []types.Event{event("evt-dup", "RunInstances", source)},
+				NextToken: awsSDK.String("next"),
+			}, nil
+		}
+		return &sdkcloudtrail.LookupEventsOutput{
+			Events: []types.Event{event("evt-dup", "RunInstances", source)},
+		}, nil
+	case "iam.amazonaws.com":
+		return &sdkcloudtrail.LookupEventsOutput{
+			Events: []types.Event{event("evt-iam", "DeleteRole", source)},
+		}, nil
+	default:
+		return &sdkcloudtrail.LookupEventsOutput{}, nil
+	}
+}
+
+func TestIndexer_IndexRegion_SourceConcurrencyAndDedupe(t *testing.T) {
+	i := NewIndexer(awsSDK.Config{}, "111111111111", "aws", nil, Options{
+		WindowDays:         7,
+		MaxEventsPerRegion: 100,
+		LookupInterval:     0,
+		SourceConcurrency:  3,
+	})
+	api := &concurrentLookupAPI{barrier: make(chan struct{})}
+	i.newCloudTrail = func(cfg awsSDK.Config) cloudTrailLookupAPI { return api }
+
+	res, err := i.IndexRegion(context.Background(), "us-east-1")
+	if err != nil {
+		t.Fatalf("IndexRegion: %v", err)
+	}
+	if res.Summary.Indexed != 2 {
+		t.Fatalf("indexed: got %d want 2", res.Summary.Indexed)
+	}
+	if res.Summary.Create != 1 || res.Summary.Delete != 1 {
+		t.Fatalf("summary create/delete: %#v", res.Summary)
+	}
+	if got := atomic.LoadInt32(&api.maxSeen); got < 2 {
+		t.Fatalf("expected concurrent source lookups, max in-flight=%d", got)
+	}
+}
+
+type throttleAPIError struct{}
+
+func (throttleAPIError) Error() string        { return "ThrottlingException: Rate exceeded" }
+func (throttleAPIError) ErrorCode() string    { return "ThrottlingException" }
+func (throttleAPIError) ErrorMessage() string { return "Rate exceeded" }
+func (throttleAPIError) ErrorFault() smithy.ErrorFault {
+	return smithy.FaultClient
+}
+
+type throttlingLookupAPI struct {
+	attempts atomic.Int32
+}
+
+func (f *throttlingLookupAPI) LookupEvents(ctx context.Context, params *sdkcloudtrail.LookupEventsInput, optFns ...func(*sdkcloudtrail.Options)) (*sdkcloudtrail.LookupEventsOutput, error) {
+	source := ""
+	if len(params.LookupAttributes) == 1 && params.LookupAttributes[0].AttributeValue != nil {
+		source = awsSDK.ToString(params.LookupAttributes[0].AttributeValue)
+	}
+	if source == "ec2.amazonaws.com" {
+		n := f.attempts.Add(1)
+		if n <= 2 {
+			return nil, throttleAPIError{}
+		}
+		return &sdkcloudtrail.LookupEventsOutput{
+			Events: []types.Event{
+				{
+					EventId:     awsSDK.String("evt-throttle"),
+					EventName:   awsSDK.String("RunInstances"),
+					EventSource: awsSDK.String("ec2.amazonaws.com"),
+					EventTime:   awsSDK.Time(time.Date(2026, 2, 24, 10, 0, 0, 0, time.UTC)),
+					CloudTrailEvent: awsSDK.String(`{
+  "eventSource":"ec2.amazonaws.com",
+  "eventName":"RunInstances"
+}`),
+				},
+			},
+		}, nil
+	}
+	return &sdkcloudtrail.LookupEventsOutput{}, nil
+}
+
+func TestIndexer_IndexRegion_RetriesThrottling(t *testing.T) {
+	i := NewIndexer(awsSDK.Config{}, "111111111111", "aws", nil, Options{
+		WindowDays:         7,
+		MaxEventsPerRegion: 100,
+		LookupInterval:     0,
+		SourceConcurrency:  1,
+	})
+	api := &throttlingLookupAPI{}
+	i.newCloudTrail = func(cfg awsSDK.Config) cloudTrailLookupAPI { return api }
+
+	res, err := i.IndexRegion(context.Background(), "us-east-1")
+	if err != nil {
+		t.Fatalf("IndexRegion: %v", err)
+	}
+	if res.Summary.Indexed != 1 {
+		t.Fatalf("indexed: got %d want 1", res.Summary.Indexed)
+	}
+	if got := api.attempts.Load(); got < 3 {
+		t.Fatalf("expected retries on throttling, attempts=%d", got)
 	}
 }

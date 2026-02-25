@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"awscope/internal/graph"
@@ -71,6 +74,7 @@ func (p *Provider) listRegion(ctx context.Context, api acmAPI, partition, accoun
 	allStatuses := types.CertificateStatus("").Values()
 	allKeyTypes := types.KeyAlgorithm("").Values()
 
+	var summaries []types.CertificateSummary
 	var nextToken *string
 	for {
 		out, err := api.ListCertificates(ctx, &sdkacm.ListCertificatesInput{
@@ -81,29 +85,74 @@ func (p *Provider) listRegion(ctx context.Context, api acmAPI, partition, accoun
 		if err != nil {
 			return nil, nil, err
 		}
-
-		for _, c := range out.CertificateSummaryList {
-			n, stubs, es := normalizeCertificateSummary(partition, accountID, region, c, nil, now)
-
-			certArn := strings.TrimSpace(awsToString(c.CertificateArn))
-			if certArn != "" {
-				detail, err := api.DescribeCertificate(ctx, &sdkacm.DescribeCertificateInput{CertificateArn: awsSDK.String(certArn)})
-				if err == nil {
-					n, stubs, es = normalizeCertificateSummary(partition, accountID, region, c, detail, now)
-				} else if !isAPIErrorCode(err, "AccessDeniedException") && !isAPIErrorCode(err, "AccessDenied") && !isAPIErrorCode(err, "ResourceNotFoundException") {
-					return nil, nil, err
-				}
-			}
-
-			nodes = append(nodes, n)
-			nodes = append(nodes, stubs...)
-			edges = append(edges, es...)
-		}
+		summaries = append(summaries, out.CertificateSummaryList...)
 
 		if out.NextToken == nil || strings.TrimSpace(*out.NextToken) == "" {
 			break
 		}
 		nextToken = out.NextToken
+	}
+
+	type certResult struct {
+		nodes []graph.ResourceNode
+		edges []graph.RelationshipEdge
+		err   error
+	}
+	results := make([]certResult, len(summaries))
+	conc := envIntOr("AWSCOPE_ACM_DESCRIBE_CONCURRENCY", 8)
+	if conc > len(summaries) {
+		conc = len(summaries)
+	}
+	if conc < 1 {
+		conc = 1
+	}
+	type job struct {
+		idx int
+		c   types.CertificateSummary
+	}
+	jobs := make(chan job, len(summaries))
+	for i, c := range summaries {
+		jobs <- job{idx: i, c: c}
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for j := range jobs {
+			n, stubs, es := normalizeCertificateSummary(partition, accountID, region, j.c, nil, now)
+
+			certArn := strings.TrimSpace(awsToString(j.c.CertificateArn))
+			if certArn != "" {
+				detail, err := api.DescribeCertificate(ctx, &sdkacm.DescribeCertificateInput{CertificateArn: awsSDK.String(certArn)})
+				if err == nil {
+					n, stubs, es = normalizeCertificateSummary(partition, accountID, region, j.c, detail, now)
+				} else if !isAPIErrorCode(err, "AccessDeniedException") && !isAPIErrorCode(err, "AccessDenied") && !isAPIErrorCode(err, "ResourceNotFoundException") {
+					results[j.idx] = certResult{err: err}
+					continue
+				}
+			}
+			ns := make([]graph.ResourceNode, 0, 1+len(stubs))
+			ns = append(ns, n)
+			ns = append(ns, stubs...)
+			results[j.idx] = certResult{
+				nodes: ns,
+				edges: es,
+			}
+		}
+	}
+	wg.Add(conc)
+	for i := 0; i < conc; i++ {
+		go worker()
+	}
+	wg.Wait()
+
+	for _, r := range results {
+		if r.err != nil {
+			return nil, nil, r.err
+		}
+		nodes = append(nodes, r.nodes...)
+		edges = append(edges, r.edges...)
 	}
 
 	return nodes, edges, nil
@@ -280,4 +329,16 @@ func isAPIErrorCode(err error, code string) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(ae.ErrorCode()), strings.TrimSpace(code))
+}
+
+func envIntOr(name string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
 }

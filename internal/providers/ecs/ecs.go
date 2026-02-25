@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"awscope/internal/graph"
@@ -86,77 +88,173 @@ func (p *Provider) listRegion(ctx context.Context, api ecsAPI, partition, accoun
 		return nil, nil, err
 	}
 
+	type clusterResult struct {
+		nodes []graph.ResourceNode
+		edges []graph.RelationshipEdge
+		err   error
+	}
+	results := make([]clusterResult, len(clusters))
+	jobs := make(chan int, len(clusters))
+	for i := range clusters {
+		jobs <- i
+	}
+	close(jobs)
+	workers := envIntOr("AWSCOPE_ECS_CLUSTER_CONCURRENCY", 8)
+	if workers > len(clusters) {
+		workers = len(clusters)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for idx := range jobs {
+			nodes, edges, err := p.collectCluster(ctx, api, partition, accountID, region, clusters[idx], now)
+			results[idx] = clusterResult{nodes: nodes, edges: edges, err: err}
+		}
+	}
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go worker()
+	}
+	wg.Wait()
+
 	var (
 		nodes []graph.ResourceNode
 		edges []graph.RelationshipEdge
 	)
-
-	for _, c := range clusters {
-		nodes = append(nodes, normalizeCluster(partition, accountID, region, c, now))
-
-		// Accumulate task definitions referenced by services/tasks to enrich inventory and enable pricing estimates.
-		tdSet := map[string]bool{}
-		tdInfo := map[string]taskDefInfo{}
-
-		// v1: include services in scan. This can be expensive for accounts with many clusters.
-		serviceArns, err := listAllServices(ctx, api, awsToString(c.ClusterArn))
-		if err != nil {
-			return nil, nil, err
+	for _, r := range results {
+		if r.err != nil {
+			return nil, nil, r.err
 		}
-		services, err := describeServices(ctx, api, awsToString(c.ClusterArn), serviceArns)
-		if err != nil {
-			return nil, nil, err
-		}
-		for _, s := range services {
-			if td := strings.TrimSpace(awsToString(s.TaskDefinition)); td != "" {
-				tdSet[td] = true
-			}
-		}
+		nodes = append(nodes, r.nodes...)
+		edges = append(edges, r.edges...)
+	}
+	return nodes, edges, nil
+}
 
-		// Tasks: include RUNNING tasks for operational actions (stop task).
-		taskArns, err := listAllTasks(ctx, api, awsToString(c.ClusterArn))
-		if err != nil {
-			return nil, nil, err
-		}
-		tasks, err := describeTasks(ctx, api, awsToString(c.ClusterArn), taskArns)
-		if err != nil {
-			return nil, nil, err
-		}
+func (p *Provider) collectCluster(ctx context.Context, api ecsAPI, partition, accountID, region string, c types.Cluster, now time.Time) ([]graph.ResourceNode, []graph.RelationshipEdge, error) {
+	var (
+		nodes []graph.ResourceNode
+		edges []graph.RelationshipEdge
+	)
+	nodes = append(nodes, normalizeCluster(partition, accountID, region, c, now))
 
-		for _, t := range tasks {
-			if td := strings.TrimSpace(awsToString(t.TaskDefinitionArn)); td != "" {
-				tdSet[td] = true
-			}
-		}
+	tdSet := map[string]bool{}
+	tdInfo := map[string]taskDefInfo{}
 
-		// Describe referenced task definitions (best-effort).
-		for tdArn := range tdSet {
+	clusterArn := awsToString(c.ClusterArn)
+	serviceArns, err := listAllServices(ctx, api, clusterArn)
+	if err != nil {
+		return nil, nil, err
+	}
+	services, err := describeServices(ctx, api, clusterArn, serviceArns)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, s := range services {
+		if td := strings.TrimSpace(awsToString(s.TaskDefinition)); td != "" {
+			tdSet[td] = true
+		}
+	}
+
+	taskArns, err := listAllTasks(ctx, api, clusterArn)
+	if err != nil {
+		return nil, nil, err
+	}
+	tasks, err := describeTasks(ctx, api, clusterArn, taskArns)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, t := range tasks {
+		if td := strings.TrimSpace(awsToString(t.TaskDefinitionArn)); td != "" {
+			tdSet[td] = true
+		}
+	}
+
+	tdArns := make([]string, 0, len(tdSet))
+	for tdArn := range tdSet {
+		tdArns = append(tdArns, tdArn)
+	}
+	tdNodes, tdInfo := describeTaskDefinitionsParallel(ctx, api, partition, accountID, region, tdArns, now)
+	nodes = append(nodes, tdNodes...)
+
+	for _, s := range services {
+		n, stubs, es := normalizeService(partition, accountID, region, s, tdInfo, now)
+		nodes = append(nodes, n)
+		nodes = append(nodes, stubs...)
+		edges = append(edges, es...)
+	}
+
+	clusterName := clusterNameFromArn(clusterArn)
+	for _, t := range tasks {
+		n, stubs, es := normalizeTask(partition, accountID, region, clusterName, t, tdInfo, now)
+		nodes = append(nodes, n)
+		nodes = append(nodes, stubs...)
+		edges = append(edges, es...)
+	}
+	return nodes, edges, nil
+}
+
+func describeTaskDefinitionsParallel(ctx context.Context, api ecsAPI, partition, accountID, region string, tdArns []string, now time.Time) ([]graph.ResourceNode, map[string]taskDefInfo) {
+	if len(tdArns) == 0 {
+		return nil, map[string]taskDefInfo{}
+	}
+	type tdResult struct {
+		node *graph.ResourceNode
+		arn  string
+		info taskDefInfo
+	}
+	results := make([]tdResult, len(tdArns))
+	jobs := make(chan int, len(tdArns))
+	for i := range tdArns {
+		jobs <- i
+	}
+	close(jobs)
+
+	workers := envIntOr("AWSCOPE_ECS_TASKDEF_CONCURRENCY", 20)
+	if workers > len(tdArns) {
+		workers = len(tdArns)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for idx := range jobs {
+			tdArn := tdArns[idx]
 			out, err := api.DescribeTaskDefinition(ctx, &sdkecs.DescribeTaskDefinitionInput{TaskDefinition: &tdArn})
 			if err != nil || out == nil || out.TaskDefinition == nil {
 				continue
 			}
 			td := *out.TaskDefinition
-			nodes = append(nodes, normalizeTaskDefinition(partition, accountID, region, tdArn, td, now))
-			tdInfo[tdArn] = extractTaskDefInfo(td)
-		}
-
-		for _, s := range services {
-			n, stubs, es := normalizeService(partition, accountID, region, s, tdInfo, now)
-			nodes = append(nodes, n)
-			nodes = append(nodes, stubs...)
-			edges = append(edges, es...)
-		}
-
-		clusterName := clusterNameFromArn(awsToString(c.ClusterArn))
-		for _, t := range tasks {
-			n, stubs, es := normalizeTask(partition, accountID, region, clusterName, t, tdInfo, now)
-			nodes = append(nodes, n)
-			nodes = append(nodes, stubs...)
-			edges = append(edges, es...)
+			n := normalizeTaskDefinition(partition, accountID, region, tdArn, td, now)
+			results[idx] = tdResult{
+				node: &n,
+				arn:  tdArn,
+				info: extractTaskDefInfo(td),
+			}
 		}
 	}
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go worker()
+	}
+	wg.Wait()
 
-	return nodes, edges, nil
+	nodes := make([]graph.ResourceNode, 0, len(results))
+	info := map[string]taskDefInfo{}
+	for _, r := range results {
+		if r.node == nil {
+			continue
+		}
+		nodes = append(nodes, *r.node)
+		info[r.arn] = r.info
+	}
+	return nodes, info
 }
 
 func listAllClusters(ctx context.Context, api ecsAPI) ([]string, error) {
@@ -634,4 +732,16 @@ func awsToString[T ~string](p *T) string {
 		return ""
 	}
 	return string(*p)
+}
+
+func envIntOr(name string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
 }

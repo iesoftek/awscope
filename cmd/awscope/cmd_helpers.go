@@ -2,7 +2,11 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"awscope/internal/core"
 	"awscope/internal/cost"
@@ -18,6 +22,18 @@ func parseCSV(s string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+func intEnvOr(name string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return fallback
+	}
+	return n
 }
 
 func sanitizeFilename(s string) string {
@@ -96,4 +112,82 @@ func formatDetailedScanSummary(res core.ScanResult) string {
 	fmt.Fprintf(&b, "    unknown resources: %d", res.Summary.Pricing.UnknownCount)
 
 	return b.String()
+}
+
+func formatScanPerformanceSummary(res core.ScanResult) string {
+	p := res.Performance
+	if p.TotalDuration <= 0 && len(p.PhaseDurations) == 0 && len(p.SlowSteps) == 0 {
+		return "performance:\n  - unavailable"
+	}
+
+	var b strings.Builder
+	delta := p.TotalDuration - p.TargetDuration
+	targetStatus := "met"
+	if !p.TargetMet {
+		targetStatus = fmt.Sprintf("missed by %s", formatDurationAbs(delta))
+	}
+	fmt.Fprintf(&b, "performance: total=%s target=%s (%s)\n",
+		formatDurationCompact(p.TotalDuration),
+		formatDurationCompact(p.TargetDuration),
+		targetStatus,
+	)
+
+	phaseOrder := []core.ScanProgressPhase{
+		core.PhaseProvider,
+		core.PhaseResolver,
+		core.PhaseAudit,
+		core.PhaseCost,
+	}
+	parts := make([]string, 0, len(phaseOrder))
+	for _, ph := range phaseOrder {
+		if d, ok := p.PhaseDurations[ph]; ok {
+			parts = append(parts, fmt.Sprintf("%s=%s", ph, formatDurationCompact(d)))
+		}
+	}
+	if len(parts) > 0 {
+		fmt.Fprintf(&b, "  phase %s\n", strings.Join(parts, " "))
+	}
+
+	if len(p.SlowSteps) > 0 {
+		b.WriteString("  slow steps:\n")
+		steps := append([]core.ScanSlowStep(nil), p.SlowSteps...)
+		sort.Slice(steps, func(i, j int) bool {
+			if steps[i].Duration != steps[j].Duration {
+				return steps[i].Duration > steps[j].Duration
+			}
+			if steps[i].Phase != steps[j].Phase {
+				return steps[i].Phase < steps[j].Phase
+			}
+			if steps[i].ProviderID != steps[j].ProviderID {
+				return steps[i].ProviderID < steps[j].ProviderID
+			}
+			return steps[i].Region < steps[j].Region
+		})
+		if len(steps) > 10 {
+			steps = steps[:10]
+		}
+		for _, s := range steps {
+			fmt.Fprintf(&b, "    %-8s %-16s %-14s %s\n",
+				s.Phase, s.ProviderID, s.Region, formatDurationCompact(s.Duration))
+		}
+	}
+
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func formatDurationCompact(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	if d < time.Second {
+		return d.Round(10 * time.Millisecond).String()
+	}
+	return d.Round(100 * time.Millisecond).String()
+}
+
+func formatDurationAbs(d time.Duration) string {
+	if d < 0 {
+		d = -d
+	}
+	return formatDurationCompact(d)
 }

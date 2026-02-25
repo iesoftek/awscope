@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"awscope/internal/graph"
@@ -87,29 +90,71 @@ func (p *Provider) List(ctx context.Context, cfg awsSDK.Config, req providers.Li
 	if err != nil {
 		return providers.ListResult{}, err
 	}
-	for _, r := range roles {
-		roleNode := normalizeRole(req.Partition, req.AccountID, r, now)
-		addNode(roleNode)
+	type roleResult struct {
+		roleNode graph.ResourceNode
+		stubs    []graph.ResourceNode
+		edges    []graph.RelationshipEdge
+		err      error
+	}
+	roleResults := make([]roleResult, len(roles))
+	roleWorkers := envIntOr("AWSCOPE_IAM_ROLE_CONCURRENCY", 12)
+	if roleWorkers > len(roles) {
+		roleWorkers = len(roles)
+	}
+	if roleWorkers < 1 {
+		roleWorkers = 1
+	}
+	roleJobs := make(chan int, len(roles))
+	for i := range roles {
+		roleJobs <- i
+	}
+	close(roleJobs)
+	var roleWG sync.WaitGroup
+	roleWorker := func() {
+		defer roleWG.Done()
+		for idx := range roleJobs {
+			r := roles[idx]
+			roleNode := normalizeRole(req.Partition, req.AccountID, r, now)
+			res := roleResult{roleNode: roleNode}
 
-		attached, err := listAllAttachedRolePolicies(ctx, api, awsToString(r.RoleName))
-		if err != nil {
-			return providers.ListResult{}, err
-		}
-		for _, ap := range attached {
-			pArn := awsToString(ap.PolicyArn)
-			if pArn == "" {
+			attached, err := listAllAttachedRolePolicies(ctx, api, awsToString(r.RoleName))
+			if err != nil {
+				res.err = err
+				roleResults[idx] = res
 				continue
 			}
-			pKey := graph.EncodeResourceKey(req.Partition, req.AccountID, "global", "iam:policy", pArn)
-			addNode(stubNode(pKey, "iam", "iam:policy", shortArn(pArn), now, "iam"))
-			edges = append(edges, graph.RelationshipEdge{
-				From:        roleNode.Key,
-				To:          pKey,
-				Kind:        "attached-policy",
-				Meta:        map[string]any{"direct": true},
-				CollectedAt: now,
-			})
+			for _, ap := range attached {
+				pArn := awsToString(ap.PolicyArn)
+				if pArn == "" {
+					continue
+				}
+				pKey := graph.EncodeResourceKey(req.Partition, req.AccountID, "global", "iam:policy", pArn)
+				res.stubs = append(res.stubs, stubNode(pKey, "iam", "iam:policy", shortArn(pArn), now, "iam"))
+				res.edges = append(res.edges, graph.RelationshipEdge{
+					From:        roleNode.Key,
+					To:          pKey,
+					Kind:        "attached-policy",
+					Meta:        map[string]any{"direct": true},
+					CollectedAt: now,
+				})
+			}
+			roleResults[idx] = res
 		}
+	}
+	roleWG.Add(roleWorkers)
+	for i := 0; i < roleWorkers; i++ {
+		go roleWorker()
+	}
+	roleWG.Wait()
+	for _, rr := range roleResults {
+		if rr.err != nil {
+			return providers.ListResult{}, rr.err
+		}
+		addNode(rr.roleNode)
+		for _, n := range rr.stubs {
+			addNode(n)
+		}
+		edges = append(edges, rr.edges...)
 	}
 
 	credRows, credErr := fetchCredentialReport(ctx, api)
@@ -119,11 +164,9 @@ func (p *Provider) List(ctx context.Context, cfg awsSDK.Config, req providers.Li
 	}
 
 	// Groups: best-effort
-	groupNodes := map[string]graph.ResourceNode{} // group name -> node
 	if groups, err := listAllGroups(ctx, api); err == nil {
 		for _, g := range groups {
 			gn := normalizeGroup(req.Partition, req.AccountID, g, now)
-			groupNodes[awsToString(g.GroupName)] = gn
 			addNode(gn)
 		}
 	}
@@ -132,163 +175,178 @@ func (p *Provider) List(ctx context.Context, cfg awsSDK.Config, req providers.Li
 	if err != nil {
 		return providers.ListResult{}, err
 	}
+	type userResult struct {
+		userNode graph.ResourceNode
+		nodes    []graph.ResourceNode
+		edges    []graph.RelationshipEdge
+	}
+	userConc := envIntOr("AWSCOPE_IAM_USER_CONCURRENCY", 8)
+	if userConc > len(users) {
+		userConc = len(users)
+	}
+	if userConc < 1 {
+		userConc = 1
+	}
+	jobs := make(chan types.User, len(users))
 	for _, u := range users {
-		un := normalizeUserBase(req.Partition, req.AccountID, u, now)
+		jobs <- u
+	}
+	close(jobs)
 
-		userName := awsToString(u.UserName)
-		if userName == "" {
-			// Unusual, but avoid crashing on empty usernames.
-			userName = un.DisplayName
-		}
-
-		// Groups membership (best-effort).
-		var groupNames []string
-		if userName != "" {
-			if gs, err := listAllGroupsForUser(ctx, api, userName); err == nil {
-				for _, g := range gs {
-					name := awsToString(g.GroupName)
-					if name != "" {
-						groupNames = append(groupNames, name)
-					}
-					gn, ok := groupNodes[name]
-					if !ok {
-						gn = normalizeGroup(req.Partition, req.AccountID, g, now)
-						groupNodes[name] = gn
-						addNode(gn)
-					}
-					edges = append(edges, graph.RelationshipEdge{
-						From:        un.Key,
-						To:          gn.Key,
-						Kind:        "member-of",
-						Meta:        map[string]any{},
-						CollectedAt: now,
-					})
-				}
+	results := make(chan userResult, len(users))
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for u := range jobs {
+			un := normalizeUserBase(req.Partition, req.AccountID, u, now)
+			userName := awsToString(u.UserName)
+			if userName == "" {
+				userName = un.DisplayName
 			}
-		}
-		sort.Strings(groupNames)
 
-		// Access keys (best-effort).
-		var (
-			keySummaries []string
-			keyCount     int
-		)
-		if userName != "" {
-			if kms, err := listAllAccessKeys(ctx, api, userName); err == nil {
-				for _, km := range kms {
-					kn := normalizeAccessKey(req.Partition, req.AccountID, userName, km, now)
-					addNode(kn)
-					edges = append(edges, graph.RelationshipEdge{
-						From:        un.Key,
-						To:          kn.Key,
-						Kind:        "contains",
-						Meta:        map[string]any{},
-						CollectedAt: now,
-					})
-					keyCount++
+			var (
+				groupNames   []string
+				localNodes   []graph.ResourceNode
+				localEdges   []graph.RelationshipEdge
+				keySummaries []string
+				keyCount     int
+			)
+			if userName != "" {
+				if gs, err := listAllGroupsForUser(ctx, api, userName); err == nil {
+					for _, g := range gs {
+						name := awsToString(g.GroupName)
+						if name != "" {
+							groupNames = append(groupNames, name)
+						}
+						gn := normalizeGroup(req.Partition, req.AccountID, g, now)
+						localNodes = append(localNodes, gn)
+						localEdges = append(localEdges, graph.RelationshipEdge{
+							From:        un.Key,
+							To:          gn.Key,
+							Kind:        "member-of",
+							Meta:        map[string]any{},
+							CollectedAt: now,
+						})
+					}
+				}
+				if kms, err := listAllAccessKeys(ctx, api, userName); err == nil {
+					for _, km := range kms {
+						kn := normalizeAccessKey(req.Partition, req.AccountID, userName, km, now)
+						keyCount++
+						if id := awsToString(km.AccessKeyId); id != "" {
+							if lu, err := api.GetAccessKeyLastUsed(ctx, &sdkiam.GetAccessKeyLastUsedInput{AccessKeyId: &id}); err == nil && lu != nil {
+								if lu.AccessKeyLastUsed.LastUsedDate != nil {
+									kn.Attributes["last_used_at"] = lu.AccessKeyLastUsed.LastUsedDate.UTC().Format("2006-01-02 15:04")
+								}
+								if strings.TrimSpace(awsToString(lu.AccessKeyLastUsed.Region)) != "" {
+									kn.Attributes["last_used_region"] = strings.TrimSpace(awsToString(lu.AccessKeyLastUsed.Region))
+								}
+								if strings.TrimSpace(awsToString(lu.AccessKeyLastUsed.ServiceName)) != "" {
+									kn.Attributes["last_used_service"] = strings.TrimSpace(awsToString(lu.AccessKeyLastUsed.ServiceName))
+								}
+							}
+						}
+						localNodes = append(localNodes, kn)
+						localEdges = append(localEdges, graph.RelationshipEdge{
+							From:        un.Key,
+							To:          kn.Key,
+							Kind:        "contains",
+							Meta:        map[string]any{},
+							CollectedAt: now,
+						})
 
-					// Best-effort: last used.
-					if id := awsToString(km.AccessKeyId); id != "" {
-						if lu, err := api.GetAccessKeyLastUsed(ctx, &sdkiam.GetAccessKeyLastUsedInput{AccessKeyId: &id}); err == nil && lu != nil {
-							if lu.AccessKeyLastUsed.LastUsedDate != nil {
-								kn.Attributes["last_used_at"] = lu.AccessKeyLastUsed.LastUsedDate.UTC().Format("2006-01-02 15:04")
-							}
-							if strings.TrimSpace(awsToString(lu.AccessKeyLastUsed.Region)) != "" {
-								kn.Attributes["last_used_region"] = strings.TrimSpace(awsToString(lu.AccessKeyLastUsed.Region))
-							}
-							if strings.TrimSpace(awsToString(lu.AccessKeyLastUsed.ServiceName)) != "" {
-								kn.Attributes["last_used_service"] = strings.TrimSpace(awsToString(lu.AccessKeyLastUsed.ServiceName))
-							}
-							// Update deduped node.
-							nodesByKey[kn.Key] = kn
+						suffix := shortenKeyID(awsToString(km.AccessKeyId))
+						st := string(km.Status)
+						age := ""
+						if v, ok := kn.Attributes["age_days"].(int); ok {
+							age = fmt.Sprintf("%dd", v)
+						} else if v, ok := kn.Attributes["age_days"].(int64); ok {
+							age = fmt.Sprintf("%dd", v)
+						} else if v, ok := kn.Attributes["age_days"].(float64); ok {
+							age = fmt.Sprintf("%dd", int(v))
+						}
+						if age != "" {
+							keySummaries = append(keySummaries, fmt.Sprintf("%s(%s, age=%s)", suffix, st, age))
+						} else {
+							keySummaries = append(keySummaries, fmt.Sprintf("%s(%s)", suffix, st))
 						}
 					}
-
-					// Summary string.
-					suffix := shortenKeyID(awsToString(km.AccessKeyId))
-					st := string(km.Status)
-					age := ""
-					if v, ok := kn.Attributes["age_days"].(int); ok {
-						age = fmt.Sprintf("%dd", v)
-					} else if v, ok := kn.Attributes["age_days"].(int64); ok {
-						age = fmt.Sprintf("%dd", v)
-					} else if v, ok := kn.Attributes["age_days"].(float64); ok {
-						age = fmt.Sprintf("%dd", int(v))
-					}
-					if age != "" {
-						keySummaries = append(keySummaries, fmt.Sprintf("%s(%s, age=%s)", suffix, st, age))
-					} else {
-						keySummaries = append(keySummaries, fmt.Sprintf("%s(%s)", suffix, st))
-					}
 				}
 			}
-		}
-		sort.Strings(keySummaries)
+			sort.Strings(groupNames)
+			sort.Strings(keySummaries)
 
-		// Credential report data, if available.
-		var (
-			passwordEnabledSet bool
-			passwordEnabled    bool
-			passwordLastUsed   string
-			mfaActiveSet       bool
-			mfaActive          bool
-		)
-		if row, ok := credRows[userName]; ok {
-			if v, ok := row["password_enabled"]; ok {
-				passwordEnabledSet = true
-				passwordEnabled = strings.EqualFold(strings.TrimSpace(v), "true")
+			var (
+				passwordEnabledSet bool
+				passwordEnabled    bool
+				passwordLastUsed   string
+				mfaActiveSet       bool
+				mfaActive          bool
+			)
+			if row, ok := credRows[userName]; ok {
+				if v, ok := row["password_enabled"]; ok {
+					passwordEnabledSet = true
+					passwordEnabled = strings.EqualFold(strings.TrimSpace(v), "true")
+				}
+				if v, ok := row["password_last_used"]; ok {
+					passwordLastUsed = normalizeReportTime(v)
+				}
+				if v, ok := row["mfa_active"]; ok {
+					mfaActiveSet = true
+					mfaActive = strings.EqualFold(strings.TrimSpace(v), "true")
+				}
 			}
-			if v, ok := row["password_last_used"]; ok {
-				passwordLastUsed = normalizeReportTime(v)
-			}
-			if v, ok := row["mfa_active"]; ok {
-				mfaActiveSet = true
-				mfaActive = strings.EqualFold(strings.TrimSpace(v), "true")
-			}
-		}
 
-		consoleAccess := "unknown"
-		if passwordEnabledSet {
-			if passwordEnabled {
-				consoleAccess = "console"
+			consoleAccess := "unknown"
+			if passwordEnabledSet {
+				if passwordEnabled {
+					consoleAccess = "console"
+				} else if keyCount > 0 {
+					consoleAccess = "programmatic"
+				}
 			} else if keyCount > 0 {
 				consoleAccess = "programmatic"
 			}
-		} else if keyCount > 0 {
-			consoleAccess = "programmatic"
-		}
-
-		// Enrich user attributes.
-		if passwordEnabledSet {
-			un.Attributes["password_enabled"] = passwordEnabled
-		}
-		if strings.TrimSpace(passwordLastUsed) != "" {
-			un.Attributes["password_last_used"] = passwordLastUsed
-		} else if passwordEnabledSet {
-			un.Attributes["password_last_used"] = "-"
-		}
-		if mfaActiveSet {
-			un.Attributes["mfa_active"] = mfaActive
-		}
-		un.Attributes["console_access"] = consoleAccess
-		un.Attributes["status"] = consoleAccess
-
-		un.Attributes["groups_count"] = len(groupNames)
-		if len(groupNames) > 0 {
-			un.Attributes["groups"] = strings.Join(groupNames, ", ")
-		}
-
-		un.Attributes["access_keys_count"] = keyCount
-		if len(keySummaries) > 0 {
-			// Cap to keep details readable.
-			if len(keySummaries) > 8 {
-				un.Attributes["access_keys"] = strings.Join(keySummaries[:8], ", ") + fmt.Sprintf(" (+%d more)", len(keySummaries)-8)
-			} else {
-				un.Attributes["access_keys"] = strings.Join(keySummaries, ", ")
+			if passwordEnabledSet {
+				un.Attributes["password_enabled"] = passwordEnabled
 			}
+			if strings.TrimSpace(passwordLastUsed) != "" {
+				un.Attributes["password_last_used"] = passwordLastUsed
+			} else if passwordEnabledSet {
+				un.Attributes["password_last_used"] = "-"
+			}
+			if mfaActiveSet {
+				un.Attributes["mfa_active"] = mfaActive
+			}
+			un.Attributes["console_access"] = consoleAccess
+			un.Attributes["status"] = consoleAccess
+			un.Attributes["groups_count"] = len(groupNames)
+			if len(groupNames) > 0 {
+				un.Attributes["groups"] = strings.Join(groupNames, ", ")
+			}
+			un.Attributes["access_keys_count"] = keyCount
+			if len(keySummaries) > 0 {
+				if len(keySummaries) > 8 {
+					un.Attributes["access_keys"] = strings.Join(keySummaries[:8], ", ") + fmt.Sprintf(" (+%d more)", len(keySummaries)-8)
+				} else {
+					un.Attributes["access_keys"] = strings.Join(keySummaries, ", ")
+				}
+			}
+			results <- userResult{userNode: un, nodes: localNodes, edges: localEdges}
 		}
-
-		addNode(un)
+	}
+	wg.Add(userConc)
+	for i := 0; i < userConc; i++ {
+		go worker()
+	}
+	wg.Wait()
+	close(results)
+	for r := range results {
+		addNode(r.userNode)
+		for _, n := range r.nodes {
+			addNode(n)
+		}
+		edges = append(edges, r.edges...)
 	}
 
 	nodes := make([]graph.ResourceNode, 0, len(nodesByKey))
@@ -684,6 +742,18 @@ func isIAMErrorCode(err error, code string) bool {
 		return apiErr.ErrorCode() == code
 	}
 	return false
+}
+
+func envIntOr(name string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
 }
 
 func awsToString[T ~string](p *T) string {

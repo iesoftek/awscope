@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"awscope/internal/graph"
@@ -69,77 +71,118 @@ func (p *Provider) listRegion(ctx context.Context, api sqsAPI, partition, accoun
 		return nil, nil, err
 	}
 
-	var nodes []graph.ResourceNode
-	var edges []graph.RelationshipEdge
-
+	type queueResult struct {
+		node  *graph.ResourceNode
+		edges []graph.RelationshipEdge
+		err   error
+	}
+	urls := make([]string, 0, len(resp.QueueUrls))
 	for _, url := range resp.QueueUrls {
-		url := strings.TrimSpace(url)
-		if url == "" {
-			continue
+		url = strings.TrimSpace(url)
+		if url != "" {
+			urls = append(urls, url)
 		}
-		attrsOut, err := api.GetQueueAttributes(ctx, &sdksqs.GetQueueAttributesInput{
-			QueueUrl: &url,
-			AttributeNames: []sqstypes.QueueAttributeName{
-				sqstypes.QueueAttributeNameQueueArn,
-				sqstypes.QueueAttributeNameCreatedTimestamp,
-				sqstypes.QueueAttributeNameKmsMasterKeyId,
-				sqstypes.QueueAttributeNameSqsManagedSseEnabled,
-			},
-		})
-		if err != nil {
-			return nil, nil, err
-		}
-		arn := strings.TrimSpace(attrsOut.Attributes[string(sqstypes.QueueAttributeNameQueueArn)])
-		if arn == "" {
-			continue
-		}
-		name := queueNameFromArn(arn)
-		if name == "" {
-			name = arn
-		}
-
-		key := graph.EncodeResourceKey(partition, accountID, region, "sqs:queue", arn)
-		raw, _ := json.Marshal(attrsOut.Attributes)
-		node := graph.ResourceNode{
-			Key:         key,
-			DisplayName: name,
-			Service:     "sqs",
-			Type:        "sqs:queue",
-			Arn:         arn,
-			PrimaryID:   arn,
-			Tags:        map[string]string{},
-			Attributes: map[string]any{
-				"url": url,
-			},
-			Raw:         raw,
-			CollectedAt: now,
-			Source:      "sqs",
-		}
-
-		if ts := strings.TrimSpace(attrsOut.Attributes[string(sqstypes.QueueAttributeNameCreatedTimestamp)]); ts != "" {
-			if sec, err := strconv.ParseInt(ts, 10, 64); err == nil && sec > 0 {
-				node.Attributes["created_at"] = time.Unix(sec, 0).UTC().Format("2006-01-02 15:04")
-			}
-		}
-
-		// KMS edge (optional).
-		if kms := strings.TrimSpace(attrsOut.Attributes[string(sqstypes.QueueAttributeNameKmsMasterKeyId)]); kms != "" {
-			toKey, ok := kmsRefToKey(partition, accountID, region, kms)
-			if ok {
-				edges = append(edges, graph.RelationshipEdge{
-					From:        key,
-					To:          toKey,
-					Kind:        "uses",
-					Meta:        map[string]any{"direct": true, "source": "sqs.kms"},
-					CollectedAt: now,
-				})
-			}
-			node.Attributes["kms_master_key_id"] = kms
-		}
-
-		nodes = append(nodes, node)
+	}
+	if len(urls) == 0 {
+		return nil, nil, nil
 	}
 
+	results := make([]queueResult, len(urls))
+	jobs := make(chan int, len(urls))
+	for i := range urls {
+		jobs <- i
+	}
+	close(jobs)
+
+	workers := envIntOr("AWSCOPE_SQS_QUEUE_CONCURRENCY", 24)
+	if workers > len(urls) {
+		workers = len(urls)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for idx := range jobs {
+			url := urls[idx]
+			attrsOut, err := api.GetQueueAttributes(ctx, &sdksqs.GetQueueAttributesInput{
+				QueueUrl: &url,
+				AttributeNames: []sqstypes.QueueAttributeName{
+					sqstypes.QueueAttributeNameQueueArn,
+					sqstypes.QueueAttributeNameCreatedTimestamp,
+					sqstypes.QueueAttributeNameKmsMasterKeyId,
+					sqstypes.QueueAttributeNameSqsManagedSseEnabled,
+				},
+			})
+			if err != nil {
+				results[idx] = queueResult{err: err}
+				continue
+			}
+			arn := strings.TrimSpace(attrsOut.Attributes[string(sqstypes.QueueAttributeNameQueueArn)])
+			if arn == "" {
+				continue
+			}
+			name := queueNameFromArn(arn)
+			if name == "" {
+				name = arn
+			}
+			key := graph.EncodeResourceKey(partition, accountID, region, "sqs:queue", arn)
+			raw, _ := json.Marshal(attrsOut.Attributes)
+			node := graph.ResourceNode{
+				Key:         key,
+				DisplayName: name,
+				Service:     "sqs",
+				Type:        "sqs:queue",
+				Arn:         arn,
+				PrimaryID:   arn,
+				Tags:        map[string]string{},
+				Attributes:  map[string]any{"url": url},
+				Raw:         raw,
+				CollectedAt: now,
+				Source:      "sqs",
+			}
+			if ts := strings.TrimSpace(attrsOut.Attributes[string(sqstypes.QueueAttributeNameCreatedTimestamp)]); ts != "" {
+				if sec, err := strconv.ParseInt(ts, 10, 64); err == nil && sec > 0 {
+					node.Attributes["created_at"] = time.Unix(sec, 0).UTC().Format("2006-01-02 15:04")
+				}
+			}
+			var edges []graph.RelationshipEdge
+			if kms := strings.TrimSpace(attrsOut.Attributes[string(sqstypes.QueueAttributeNameKmsMasterKeyId)]); kms != "" {
+				toKey, ok := kmsRefToKey(partition, accountID, region, kms)
+				if ok {
+					edges = append(edges, graph.RelationshipEdge{
+						From:        key,
+						To:          toKey,
+						Kind:        "uses",
+						Meta:        map[string]any{"direct": true, "source": "sqs.kms"},
+						CollectedAt: now,
+					})
+				}
+				node.Attributes["kms_master_key_id"] = kms
+			}
+			results[idx] = queueResult{node: &node, edges: edges}
+		}
+	}
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go worker()
+	}
+	wg.Wait()
+
+	nodes := make([]graph.ResourceNode, 0, len(results))
+	edges := make([]graph.RelationshipEdge, 0, len(results))
+	for _, r := range results {
+		if r.err != nil {
+			return nil, nil, r.err
+		}
+		if r.node == nil {
+			continue
+		}
+		nodes = append(nodes, *r.node)
+		edges = append(edges, r.edges...)
+	}
 	return nodes, edges, nil
 }
 
@@ -183,4 +226,16 @@ func arnRegion(arn string) string {
 		return ""
 	}
 	return parts[3]
+}
+
+func envIntOr(name string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
 }

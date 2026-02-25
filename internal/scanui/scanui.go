@@ -23,8 +23,14 @@ type Options struct {
 	Regions     []string
 	ProviderIDs []string
 
-	MaxConcurrency      int
-	ResolverConcurrency int
+	MaxConcurrency               int
+	ResolverConcurrency          int
+	AuditRegionConcurrency       int
+	AuditSourceConcurrency       int
+	AuditLookupInterval          time.Duration
+	ELBv2TargetHealthConcurrency int
+	CostConcurrency              int
+	TargetDuration               time.Duration
 }
 
 type progressMsg struct {
@@ -34,6 +40,16 @@ type progressMsg struct {
 type doneMsg struct {
 	res core.ScanResult
 	err error
+}
+
+type activeStep struct {
+	Key        string
+	Phase      core.ScanProgressPhase
+	ProviderID string
+	Region     string
+	Message    string
+	StartedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 type model struct {
@@ -58,7 +74,10 @@ type model struct {
 	edgesSoFar  int
 	lastPrinted int
 
-	doneLines []string
+	doneLines     []string
+	active        map[string]activeStep
+	activeOrder   []string
+	marqueeOffset int
 
 	start time.Time
 	done  bool
@@ -79,11 +98,17 @@ func Run(ctx context.Context, st *store.Store, opts Options) (core.ScanResult, e
 
 		app := core.New(st)
 		res, err := app.ScanWithProgress(ctx, core.ScanOptions{
-			Profile:             opts.Profile,
-			Regions:             opts.Regions,
-			ProviderIDs:         opts.ProviderIDs,
-			MaxConcurrency:      opts.MaxConcurrency,
-			ResolverConcurrency: opts.ResolverConcurrency,
+			Profile:                      opts.Profile,
+			Regions:                      opts.Regions,
+			ProviderIDs:                  opts.ProviderIDs,
+			MaxConcurrency:               opts.MaxConcurrency,
+			ResolverConcurrency:          opts.ResolverConcurrency,
+			AuditRegionConcurrency:       opts.AuditRegionConcurrency,
+			AuditSourceConcurrency:       opts.AuditSourceConcurrency,
+			AuditLookupInterval:          opts.AuditLookupInterval,
+			ELBv2TargetHealthConcurrency: opts.ELBv2TargetHealthConcurrency,
+			CostConcurrency:              opts.CostConcurrency,
+			TargetDuration:               opts.TargetDuration,
 		}, func(ev core.ScanProgressEvent) {
 			if ev.Message != "done" {
 				return
@@ -114,6 +139,7 @@ func Run(ctx context.Context, st *store.Store, opts Options) (core.ScanResult, e
 		spin:     spin,
 		progress: p,
 		start:    time.Now(),
+		active:   map[string]activeStep{},
 	}
 
 	// Intentionally do not use AltScreen here: we use tea.Printf to show per-step lines,
@@ -140,11 +166,17 @@ func (m *model) Init() tea.Cmd {
 	go func() {
 		defer close(progressCh)
 		res, err := m.app.ScanWithProgress(m.ctx, core.ScanOptions{
-			Profile:             m.opts.Profile,
-			Regions:             m.opts.Regions,
-			ProviderIDs:         m.opts.ProviderIDs,
-			MaxConcurrency:      m.opts.MaxConcurrency,
-			ResolverConcurrency: m.opts.ResolverConcurrency,
+			Profile:                      m.opts.Profile,
+			Regions:                      m.opts.Regions,
+			ProviderIDs:                  m.opts.ProviderIDs,
+			MaxConcurrency:               m.opts.MaxConcurrency,
+			ResolverConcurrency:          m.opts.ResolverConcurrency,
+			AuditRegionConcurrency:       m.opts.AuditRegionConcurrency,
+			AuditSourceConcurrency:       m.opts.AuditSourceConcurrency,
+			AuditLookupInterval:          m.opts.AuditLookupInterval,
+			ELBv2TargetHealthConcurrency: m.opts.ELBv2TargetHealthConcurrency,
+			CostConcurrency:              m.opts.CostConcurrency,
+			TargetDuration:               m.opts.TargetDuration,
 		}, func(ev core.ScanProgressEvent) {
 			select {
 			case progressCh <- ev:
@@ -200,6 +232,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resSoFar = ev.ResourcesSoFar
 		m.edgesSoFar = ev.EdgesSoFar
 		m.curEv = ev
+		m.trackProgressEvent(ev, time.Now())
 		if m.total > 0 {
 			cmds = append(cmds, m.progress.SetPercent(float64(m.completed)/float64(m.total)))
 		}
@@ -270,30 +303,59 @@ func (m *model) View() string {
 	if label == "" {
 		label = "starting"
 	}
-	info := fmt.Sprintf("Scanning %s: %s | resources=%d edges=%d | %s", currentStepStyle.Render(label), m.curEv.Message, m.resSoFar, m.edgesSoFar, elapsed)
-
+	inProgress, pCount, rCount, aCount, cCount := m.activePhaseCounts()
 	cellsAvail := max(0, m.width-lipgloss.Width(spin+prog+stepCount))
-	info = lipgloss.NewStyle().MaxWidth(cellsAvail).Render(info)
-	gap := strings.Repeat(" ", max(0, m.width-lipgloss.Width(spin+info+prog+stepCount)))
+	activeSummary := fmt.Sprintf("in-progress=%2d (%s:%2d %s:%2d %s:%2d %s:%2d)",
+		inProgress,
+		phaseProviderStyle.Render("p"), pCount,
+		phaseResolverStyle.Render("r"), rCount,
+		phaseAuditStyle.Render("a"), aCount,
+		phaseCostStyle.Render("c"), cCount,
+	)
+	stepLabel := fitCell(label, 28)
+	stepMsg := fitCell(m.curEv.Message, 32)
+	headline := fmt.Sprintf("Scanning %s: %s | %6s | %s", currentStepStyle.Render(stepLabel), stepMsg, elapsed.String(), activeSummary)
+	topInfo := lipgloss.NewStyle().MaxWidth(cellsAvail).Render(headline)
+	gap := strings.Repeat(" ", max(0, m.width-lipgloss.Width(spin+topInfo+prog+stepCount)))
+	topLine := spin + topInfo + gap + prog + stepCount
 
-	progressLine := spin + info + gap + prog + stepCount
+	secondPrefix := "  active: "
+	secondAvail := max(0, m.width-lipgloss.Width(secondPrefix))
+	roster := m.renderActiveRoster(secondAvail, time.Now())
+	if roster == "" {
+		roster = activeMoreStyle.Render("[none]")
+	}
+	bottomLine := secondPrefix + lipgloss.NewStyle().MaxWidth(secondAvail).Render(roster)
 
 	// Render recent completed lines above the "sticky" progress line, package-manager style,
 	// but without tea.Printf to avoid interleaved output.
+	stickyCount := 2
+	if m.height == 1 {
+		stickyCount = 1
+	}
 	var lines []string
 	if n := len(m.doneLines); n > 0 && m.height > 0 {
-		avail := m.height - 2
-		if avail < 1 {
-			avail = 1
+		avail := m.height - stickyCount
+		if avail < 0 {
+			avail = 0
 		}
-		if n > avail {
-			lines = append(lines, fmt.Sprintf("... (%d more)", n-avail))
-			lines = append(lines, m.doneLines[n-avail:]...)
-		} else {
-			lines = append(lines, m.doneLines...)
+		if avail > 0 {
+			if n > avail {
+				lines = append(lines, fmt.Sprintf("... (%d more)", n-avail))
+				lines = append(lines, m.doneLines[n-avail:]...)
+			} else {
+				lines = append(lines, m.doneLines...)
+			}
 		}
 	}
-	lines = append(lines, progressLine)
+	lines = append(lines, topLine)
+	if stickyCount == 2 {
+		lines = append(lines, bottomLine)
+	}
+	if m.height > 0 && len(lines) < m.height {
+		pad := make([]string, m.height-len(lines))
+		lines = append(pad, lines...)
+	}
 	return strings.Join(lines, "\n")
 }
 
@@ -305,6 +367,178 @@ func isTTY() bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
+func stepKey(ev core.ScanProgressEvent) string {
+	return strings.TrimSpace(fmt.Sprintf("%s|%s|%s", ev.Phase, ev.ProviderID, ev.Region))
+}
+
+func (m *model) trackProgressEvent(ev core.ScanProgressEvent, now time.Time) {
+	if m.active == nil {
+		m.active = map[string]activeStep{}
+	}
+	key := stepKey(ev)
+	if key == "" {
+		return
+	}
+	if strings.TrimSpace(ev.Message) == "done" {
+		delete(m.active, key)
+		return
+	}
+	if cur, ok := m.active[key]; ok {
+		cur.Message = ev.Message
+		cur.UpdatedAt = now
+		m.active[key] = cur
+		return
+	}
+	m.activeOrder = append(m.activeOrder, key)
+	m.active[key] = activeStep{
+		Key:        key,
+		Phase:      ev.Phase,
+		ProviderID: ev.ProviderID,
+		Region:     ev.Region,
+		Message:    ev.Message,
+		StartedAt:  now,
+		UpdatedAt:  now,
+	}
+}
+
+func (m *model) compactActiveOrder() {
+	if len(m.activeOrder) == 0 {
+		return
+	}
+	compacted := make([]string, 0, len(m.activeOrder))
+	for _, k := range m.activeOrder {
+		if _, ok := m.active[k]; !ok {
+			continue
+		}
+		compacted = append(compacted, k)
+	}
+	m.activeOrder = compacted
+}
+
+func (m *model) activePhaseCounts() (total, providers, resolvers, audits, costs int) {
+	for _, st := range m.active {
+		total++
+		switch st.Phase {
+		case core.PhaseProvider:
+			providers++
+		case core.PhaseResolver:
+			resolvers++
+		case core.PhaseAudit:
+			audits++
+		case core.PhaseCost:
+			costs++
+		}
+	}
+	return total, providers, resolvers, audits, costs
+}
+
+func (m *model) renderActiveRoster(width int, now time.Time) string {
+	if width <= 0 {
+		return ""
+	}
+	m.compactActiveOrder()
+	if len(m.activeOrder) == 0 {
+		return ""
+	}
+
+	phaseByPR := map[string]int{}
+	for _, k := range m.activeOrder {
+		st, ok := m.active[k]
+		if !ok {
+			continue
+		}
+		pr := fmt.Sprintf("%s/%s", strings.TrimSpace(st.ProviderID), strings.TrimSpace(st.Region))
+		phaseByPR[pr]++
+	}
+
+	tokens := make([]string, 0, len(m.activeOrder))
+	for _, k := range m.activeOrder {
+		st, ok := m.active[k]
+		if !ok {
+			continue
+		}
+		provider := strings.TrimSpace(st.ProviderID)
+		if provider == "" {
+			provider = "-"
+		}
+		region := strings.TrimSpace(st.Region)
+		if region == "" {
+			region = "-"
+		}
+		label := provider + "/" + region
+		if phaseByPR[label] > 1 {
+			label = string(st.Phase) + ":" + label
+		}
+		elapsed := now.Sub(st.StartedAt).Round(time.Second)
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		labelFixed := fitCell(label, 24)
+		elapsedFixed := fmt.Sprintf("%6s", formatStepElapsed(elapsed))
+		tokens = append(tokens, fmt.Sprintf("[%s %s]", phaseStyle(st.Phase).Render(labelFixed), activeElapsedStyle.Render(elapsedFixed)))
+	}
+	if len(tokens) == 0 {
+		return ""
+	}
+
+	full := strings.Join(tokens, " ")
+	if lipgloss.Width(full) <= width {
+		return full
+	}
+
+	var outParts []string
+	used := 0
+	for i, tok := range tokens {
+		tokW := lipgloss.Width(tok)
+		sepW := 0
+		if len(outParts) > 0 {
+			sepW = 1
+		}
+		if used+sepW+tokW > width {
+			hidden := len(tokens) - i
+			more := fmt.Sprintf("(+%d more)", hidden)
+			moreW := lipgloss.Width(more)
+			if len(outParts) == 0 {
+				return lipgloss.NewStyle().MaxWidth(width).Render(activeMoreStyle.Render(more))
+			}
+			for len(outParts) > 0 && used+1+moreW > width {
+				last := outParts[len(outParts)-1]
+				lastW := lipgloss.Width(last)
+				outParts = outParts[:len(outParts)-1]
+				used -= lastW
+				if len(outParts) > 0 {
+					used -= 1
+				}
+			}
+			if len(outParts) == 0 {
+				return lipgloss.NewStyle().MaxWidth(width).Render(activeMoreStyle.Render(more))
+			}
+			return strings.Join(outParts, " ") + " " + activeMoreStyle.Render(more)
+		}
+		if sepW > 0 {
+			used += sepW
+		}
+		outParts = append(outParts, tok)
+		used += tokW
+	}
+	return strings.Join(outParts, " ")
+}
+
+func phaseStyle(phase core.ScanProgressPhase) lipgloss.Style {
+	switch phase {
+	case core.PhaseProvider:
+		return phaseProviderStyle
+	case core.PhaseResolver:
+		return phaseResolverStyle
+	case core.PhaseAudit:
+		return phaseAuditStyle
+	case core.PhaseCost:
+		return phaseCostStyle
+	default:
+		return activeDefaultStyle
+	}
+}
+
 func formatScanLabel(ev core.ScanProgressEvent) string {
 	label := strings.TrimSpace(fmt.Sprintf("%s %s %s", ev.Phase, ev.ProviderID, ev.Region))
 	if label == "" {
@@ -314,20 +548,36 @@ func formatScanLabel(ev core.ScanProgressEvent) string {
 }
 
 func fitLabel(s string, w int) string {
+	return fitCell(s, w)
+}
+
+func fitCell(s string, w int) string {
 	s = strings.TrimSpace(s)
 	if w <= 0 {
 		return s
 	}
-	if len(s) == w {
+	if lipgloss.Width(s) == w {
 		return s
 	}
-	if len(s) < w {
-		return s + strings.Repeat(" ", w-len(s))
+	if lipgloss.Width(s) < w {
+		return s + strings.Repeat(" ", w-lipgloss.Width(s))
 	}
-	if w <= 3 {
-		return s[:w]
+	if w <= 1 {
+		return s[:1]
 	}
-	return s[:w-3] + "..."
+	runes := []rune(s)
+	out := make([]rune, 0, len(runes))
+	for _, r := range runes {
+		next := string(append(out, r))
+		if lipgloss.Width(next) > w-1 {
+			break
+		}
+		out = append(out, r)
+	}
+	if len(out) == 0 {
+		return "…"
+	}
+	return string(out) + "…"
 }
 
 func formatScanExtras(ev core.ScanProgressEvent) string {
@@ -481,16 +731,48 @@ func trimOneLine(s string, maxLen int) string {
 	return s[:maxLen-3] + "..."
 }
 
+func formatStepElapsed(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d/time.Second))
+	}
+	if d < time.Hour {
+		m := int(d / time.Minute)
+		s := int((d % time.Minute) / time.Second)
+		return fmt.Sprintf("%dm%02ds", m, s)
+	}
+	h := int(d / time.Hour)
+	m := int((d % time.Hour) / time.Minute)
+	return fmt.Sprintf("%dh%02dm", h, m)
+}
+
 var (
-	currentStepStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("211"))
-	doneStyle        = lipgloss.NewStyle().Margin(1, 2)
-	checkMark        = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).SetString("✓")
-	crossMark        = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).SetString("✗")
-	headerStyle      = lipgloss.NewStyle().Bold(true)
+	currentStepStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("211"))
+	doneStyle          = lipgloss.NewStyle().Margin(1, 2)
+	checkMark          = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).SetString("✓")
+	crossMark          = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).SetString("✗")
+	headerStyle        = lipgloss.NewStyle().Bold(true)
+	phaseProviderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
+	phaseResolverStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	phaseAuditStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	phaseCostStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	activeDefaultStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250"))
+	activeElapsedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	activeMoreStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("246"))
 )
 
 func max(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b

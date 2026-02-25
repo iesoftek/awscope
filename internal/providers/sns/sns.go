@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"awscope/internal/graph"
@@ -13,6 +16,7 @@ import (
 
 	awsSDK "github.com/aws/aws-sdk-go-v2/aws"
 	sdksns "github.com/aws/aws-sdk-go-v2/service/sns"
+	snstypes "github.com/aws/aws-sdk-go-v2/service/sns/types"
 )
 
 func init() {
@@ -62,16 +66,46 @@ func (p *Provider) List(ctx context.Context, cfg awsSDK.Config, req providers.Li
 
 func (p *Provider) listRegion(ctx context.Context, api snsAPI, partition, accountID, region string) ([]graph.ResourceNode, []graph.RelationshipEdge, error) {
 	now := time.Now().UTC()
-	var nodes []graph.ResourceNode
-	var edges []graph.RelationshipEdge
 
+	var topics []snstypes.Topic
 	var token *string
 	for {
 		resp, err := api.ListTopics(ctx, &sdksns.ListTopicsInput{NextToken: token})
 		if err != nil {
 			return nil, nil, err
 		}
-		for _, t := range resp.Topics {
+		topics = append(topics, resp.Topics...)
+		if resp.NextToken == nil || *resp.NextToken == "" {
+			break
+		}
+		token = resp.NextToken
+	}
+
+	type topicResult struct {
+		nodes []graph.ResourceNode
+		edges []graph.RelationshipEdge
+		err   error
+	}
+	results := make([]topicResult, len(topics))
+	jobs := make(chan int, len(topics))
+	for i := range topics {
+		jobs <- i
+	}
+	close(jobs)
+
+	workers := envIntOr("AWSCOPE_SNS_TOPIC_CONCURRENCY", 24)
+	if workers > len(topics) {
+		workers = len(topics)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	var wg sync.WaitGroup
+	worker := func() {
+		defer wg.Done()
+		for idx := range jobs {
+			t := topics[idx]
 			arn := awsToString(t.TopicArn)
 			if arn == "" {
 				continue
@@ -92,9 +126,9 @@ func (p *Provider) listRegion(ctx context.Context, api snsAPI, partition, accoun
 				CollectedAt: now,
 				Source:      "sns",
 			}
-			nodes = append(nodes, topicNode)
+			localNodes := []graph.ResourceNode{topicNode}
+			var localEdges []graph.RelationshipEdge
 
-			// Subscriptions per topic.
 			var subTok *string
 			for {
 				sresp, err := api.ListSubscriptionsByTopic(ctx, &sdksns.ListSubscriptionsByTopicInput{
@@ -102,7 +136,8 @@ func (p *Provider) listRegion(ctx context.Context, api snsAPI, partition, accoun
 					NextToken: subTok,
 				})
 				if err != nil {
-					return nil, nil, err
+					results[idx] = topicResult{err: err}
+					break
 				}
 				for _, s := range sresp.Subscriptions {
 					subArn := awsToString(s.SubscriptionArn)
@@ -128,19 +163,18 @@ func (p *Provider) listRegion(ctx context.Context, api snsAPI, partition, accoun
 						CollectedAt: now,
 						Source:      "sns",
 					}
-					nodes = append(nodes, subNode)
-					edges = append(edges, graph.RelationshipEdge{
+					localNodes = append(localNodes, subNode)
+					localEdges = append(localEdges, graph.RelationshipEdge{
 						From:        subKey,
 						To:          key,
 						Kind:        "member-of",
 						Meta:        map[string]any{"direct": true},
 						CollectedAt: now,
 					})
-
 					if ep := awsToString(s.Endpoint); strings.HasPrefix(ep, "arn:") {
 						toKey, ok := endpointArnToKey(partition, accountID, region, ep)
 						if ok {
-							edges = append(edges, graph.RelationshipEdge{
+							localEdges = append(localEdges, graph.RelationshipEdge{
 								From:        subKey,
 								To:          toKey,
 								Kind:        "targets",
@@ -155,13 +189,26 @@ func (p *Provider) listRegion(ctx context.Context, api snsAPI, partition, accoun
 				}
 				subTok = sresp.NextToken
 			}
+			if results[idx].err == nil {
+				results[idx] = topicResult{nodes: localNodes, edges: localEdges}
+			}
 		}
-		if resp.NextToken == nil || *resp.NextToken == "" {
-			break
-		}
-		token = resp.NextToken
 	}
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go worker()
+	}
+	wg.Wait()
 
+	var nodes []graph.ResourceNode
+	var edges []graph.RelationshipEdge
+	for _, r := range results {
+		if r.err != nil {
+			return nil, nil, r.err
+		}
+		nodes = append(nodes, r.nodes...)
+		edges = append(edges, r.edges...)
+	}
 	return nodes, edges, nil
 }
 
@@ -206,4 +253,16 @@ func awsToString[T ~string](p *T) string {
 		return ""
 	}
 	return string(*p)
+}
+
+func envIntOr(name string, fallback int) int {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
 }
