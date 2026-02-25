@@ -9,6 +9,7 @@ AWS inventory scanner + interactive TUI for browsing resources and relationships
 - Service -> Type navigation, paging, filtering
 - Graph exploration (neighbors, incoming/outgoing relationships)
 - Best-effort estimated monthly cost mode (Pricing API cache)
+- Security posture findings from inventory (after scan and via `awscope security`)
 - Offline mode for browsing cached inventories
 
 ## Install / Run
@@ -23,6 +24,12 @@ Run the TUI (defaults to `tui` if you omit subcommand):
 
 ```sh
 go run ./cmd/awscope tui --profile default
+```
+
+Run the interactive security viewer:
+
+```sh
+go run ./cmd/awscope security --profile default --tui
 ```
 
 ## Scan
@@ -44,6 +51,8 @@ Common flags:
 - `--plain`: disable progress UI and print only the final summary
 - `--offline`: never call AWS; browse cached inventory only
 - `--db-path <path>`: override SQLite DB path
+- `--security-view summary|detailed`: security findings section verbosity (default `summary`)
+- `--security-color auto|always|never`: security findings color mode (default `auto`)
 
 Audit indexing behavior:
 
@@ -54,6 +63,13 @@ Audit indexing behavior:
   - `AWSCOPE_AUDIT_WINDOW_DAYS` (default `7`)
   - `AWSCOPE_AUDIT_MAX_EVENTS_PER_REGION` (default `1200`)
   - `AWSCOPE_AUDIT_MAX_REGION_DURATION_SEC` (default `120`)
+
+Scan summary behavior:
+
+- At the end of scan, awscope prints:
+  - inventory summary (counts/regions/cost),
+  - `security findings` (potential issues based on AWS best-practice controls),
+  - performance summary (phase timings + slow steps).
 
 Supported services (as of this repo state):
 
@@ -228,6 +244,74 @@ Notes:
 
 - Many services are usage-based; those will show unknown or partial estimates.
 - CloudWatch Logs estimate is storage-only (from `storedBytes`), excluding ingestion/insights/vended logs/etc.
+
+## Security
+
+Run security posture analysis from cached DB inventory (no live AWS calls):
+
+```sh
+go run ./cmd/awscope security --profile default
+```
+
+Interactive viewer:
+
+```sh
+go run ./cmd/awscope security --profile default --tui
+```
+
+Scoped examples:
+
+```sh
+go run ./cmd/awscope security --profile default --regions us-east-1,us-west-2 --services ec2,iam,s3
+```
+
+Flags:
+
+- `--profile <name>`: required; scopes analysis to the profile-mapped account in DB
+- `--regions <csv|all>`: optional; defaults to all account regions in DB
+- `--services <csv>`: optional; restrict checks to selected service set
+- `--max-key-age-days <n>`: optional IAM key-age threshold (default `90`)
+- `--view summary|detailed`: collapse/expand finding details (default `detailed`)
+- `--color auto|always|never`: output color mode (default `auto`)
+- `--tui`: open interactive fullscreen security viewer
+
+Security TUI keys:
+
+- `j/k`, `up/down`: move selection
+- `g/G`: top/bottom
+- `/`: filter findings
+- `e` or `space`: expand/collapse details
+- `q`: quit
+
+Environment:
+
+- `AWSCOPE_SECURITY_MAX_KEY_AGE_DAYS` (default `90`)
+
+Output semantics:
+
+- Findings are potential posture issues, not compliance attestation.
+- Results include severity, affected counts, sample resources, and coverage gaps.
+- Coverage gaps are shown when required service inventory is missing in scope.
+
+AWS guidance baseline used for checks:
+
+- Well-Architected Security Pillar: https://docs.aws.amazon.com/wellarchitected/latest/security-pillar/welcome.html
+- IAM Best Practices: https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html
+- Security Hub controls reference: https://docs.aws.amazon.com/securityhub/latest/userguide/securityhub-controls-reference.html
+
+Implemented v1.1 checks (mapped to AWS guidance families):
+
+- CloudTrail: `CT-001/002/003` (logging, multi-region trail, log-file validation)
+- AWS Config: `CFG-001` (recorder active coverage)
+- GuardDuty: `GD-001` (detector enabled coverage)
+- Security Hub: `SH-001` (hub enabled coverage)
+- Access Analyzer: `AA-001` (analyzer active coverage)
+- S3: `S3-001/002` (public-access-block posture, default encryption)
+- RDS: `RDS-001/002` (public accessibility, storage encryption)
+- IAM: `IAM-001/002` (console users without MFA, old active access keys)
+- Secrets Manager: `SEC-001` (rotation disabled)
+- EKS: `EKS-001` (public API exposure)
+- EC2: `EC2-001/002` (public IP on running instance, world-open SG ingress)
 
 ## Export
 

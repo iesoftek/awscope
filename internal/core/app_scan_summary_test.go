@@ -242,3 +242,38 @@ func TestScanWithProgress_PopulatesPerformanceSummary(t *testing.T) {
 		t.Fatalf("slow steps not populated: %#v", res.Performance)
 	}
 }
+
+func TestScanWithProgress_PopulatesSecuritySummary(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test.sqlite")
+
+	st, err := store.Open(store.OpenOptions{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	app := New(st)
+	app.loader = fakeLoader{id: aws.Identity{AccountID: "123456789012", Partition: "aws", Arn: "arn:aws:sts::123456789012:assumed-role/x/y"}}
+
+	providerID := "summarysvc-security"
+	if _, ok := registry.Get(providerID); !ok {
+		registry.Register(summaryProvider{id: providerID, perRegionN: 1})
+	}
+
+	res, scanErr := app.ScanWithProgress(ctx, ScanOptions{
+		Profile:     "default",
+		Regions:     []string{"us-east-1"},
+		ProviderIDs: []string{providerID},
+	}, nil)
+	if scanErr != nil {
+		t.Fatalf("scan: %v", scanErr)
+	}
+
+	if res.Summary.Security.Coverage.AssessedChecks != 0 {
+		t.Fatalf("assessed checks: got %d want 0", res.Summary.Security.Coverage.AssessedChecks)
+	}
+	if res.Summary.Security.Coverage.SkippedChecks == 0 {
+		t.Fatalf("expected skipped checks > 0")
+	}
+}

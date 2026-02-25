@@ -54,6 +54,7 @@ func newRootCommand(ctx context.Context, dbPath *string, offline *bool) *cobra.C
 	root.AddCommand(newTuiCmd(ctx, dbPath, offline))
 	root.AddCommand(newVersionCmd())
 	root.AddCommand(newScanCmd(dbPath, offline))
+	root.AddCommand(newSecurityCmd(dbPath))
 	root.AddCommand(newDiagramCmd(dbPath))
 	root.AddCommand(newExportCmd(dbPath))
 	root.AddCommand(newCacheCmd())

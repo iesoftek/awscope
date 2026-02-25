@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -173,6 +174,183 @@ func formatScanPerformanceSummary(res core.ScanResult) string {
 	}
 
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func formatSecuritySummary(sec core.ScanSecuritySummary) string {
+	return formatSecuritySummaryWithOptions(sec, securitySummaryFormatOptions{
+		ShowDetails: true,
+		Color:       false,
+	})
+}
+
+type securitySummaryFormatOptions struct {
+	ShowDetails bool
+	Color       bool
+}
+
+func formatSecuritySummaryWithOptions(sec core.ScanSecuritySummary, opts securitySummaryFormatOptions) string {
+	var b strings.Builder
+	b.WriteString(colorize("security findings:", ansiBold, opts.Color))
+	b.WriteByte('\n')
+
+	critical := sec.AffectedBySeverity[core.ScanSecuritySeverityCritical]
+	high := sec.AffectedBySeverity[core.ScanSecuritySeverityHigh]
+	medium := sec.AffectedBySeverity[core.ScanSecuritySeverityMedium]
+	low := sec.AffectedBySeverity[core.ScanSecuritySeverityLow]
+	fmt.Fprintf(&b, "  posture (affected): %s=%d %s=%d %s=%d %s=%d\n",
+		severityLabel(core.ScanSecuritySeverityCritical, opts.Color), critical,
+		severityLabel(core.ScanSecuritySeverityHigh, opts.Color), high,
+		severityLabel(core.ScanSecuritySeverityMedium, opts.Color), medium,
+		severityLabel(core.ScanSecuritySeverityLow, opts.Color), low,
+	)
+	fmt.Fprintf(&b, "  assessed checks: %d (skipped: %d)\n", sec.Coverage.AssessedChecks, sec.Coverage.SkippedChecks)
+	if opts.ShowDetails {
+		b.WriteString("  details: expanded\n")
+	} else {
+		b.WriteString("  details: collapsed\n")
+	}
+
+	if len(sec.Findings) == 0 {
+		b.WriteString("  findings: none\n")
+	} else {
+		findings := append([]core.ScanSecurityFinding(nil), sec.Findings...)
+		extra := 0
+		if len(findings) > 12 {
+			extra = len(findings) - 12
+			findings = findings[:12]
+		}
+
+		order := []core.ScanSecuritySeverity{
+			core.ScanSecuritySeverityCritical,
+			core.ScanSecuritySeverityHigh,
+			core.ScanSecuritySeverityMedium,
+			core.ScanSecuritySeverityLow,
+		}
+		for _, sev := range order {
+			var group []core.ScanSecurityFinding
+			for _, f := range findings {
+				if f.Severity == sev {
+					group = append(group, f)
+				}
+			}
+			if len(group) == 0 {
+				continue
+			}
+			fmt.Fprintf(&b, "  %s:\n", severityLabel(sev, opts.Color))
+			for _, f := range group {
+				fmt.Fprintf(&b, "    [%s] %s | affected=%d", f.CheckID, f.Title, f.AffectedCount)
+				if s := strings.TrimSpace(f.ControlRef); s != "" {
+					fmt.Fprintf(&b, " | ref=%s", s)
+				}
+				b.WriteByte('\n')
+				if !opts.ShowDetails {
+					continue
+				}
+				if len(f.Regions) > 0 {
+					regions := append([]string(nil), f.Regions...)
+					if len(regions) > 5 {
+						fmt.Fprintf(&b, "      regions: %s (+%d more)\n", strings.Join(regions[:5], ","), len(regions)-5)
+					} else {
+						fmt.Fprintf(&b, "      regions: %s\n", strings.Join(regions, ","))
+					}
+				}
+				if len(f.Samples) > 0 {
+					samples := append([]string(nil), f.Samples...)
+					if len(samples) > 5 {
+						fmt.Fprintf(&b, "      samples: %s (+%d more)\n", strings.Join(samples[:5], ", "), len(samples)-5)
+					} else {
+						fmt.Fprintf(&b, "      samples: %s\n", strings.Join(samples, ", "))
+					}
+				}
+			}
+		}
+		if extra > 0 {
+			fmt.Fprintf(&b, "  ... (+%d more findings)\n", extra)
+		}
+	}
+
+	if len(sec.Coverage.MissingServices) > 0 {
+		fmt.Fprintf(&b, "  coverage gaps: services not assessed: %s\n", strings.Join(sec.Coverage.MissingServices, ","))
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func parseSecurityDetailView(view string) (showDetails bool, err error) {
+	v := strings.TrimSpace(strings.ToLower(view))
+	switch v {
+	case "", "summary", "collapsed", "collapse":
+		return false, nil
+	case "detailed", "expanded", "expand":
+		return true, nil
+	default:
+		return false, fmt.Errorf("invalid security view %q (expected summary|detailed)", view)
+	}
+}
+
+func resolveColorEnabled(mode string, w io.Writer) (bool, error) {
+	m := strings.TrimSpace(strings.ToLower(mode))
+	switch m {
+	case "", "auto":
+		if _, ok := os.LookupEnv("NO_COLOR"); ok {
+			return false, nil
+		}
+		if strings.TrimSpace(os.Getenv("FORCE_COLOR")) != "" {
+			return true, nil
+		}
+		return isTTYWriter(w), nil
+	case "always":
+		return true, nil
+	case "never":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid color mode %q (expected auto|always|never)", mode)
+	}
+}
+
+func isTTYWriter(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	if !ok || f == nil {
+		return false
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+const (
+	ansiReset  = "\x1b[0m"
+	ansiBold   = "1"
+	ansiRed    = "31"
+	ansiYellow = "33"
+	ansiCyan   = "36"
+)
+
+func severityLabel(sev core.ScanSecuritySeverity, color bool) string {
+	text := string(sev)
+	if !color {
+		return text
+	}
+	switch sev {
+	case core.ScanSecuritySeverityCritical:
+		return colorize(text, ansiBold+";"+ansiRed, true)
+	case core.ScanSecuritySeverityHigh:
+		return colorize(text, ansiRed, true)
+	case core.ScanSecuritySeverityMedium:
+		return colorize(text, ansiYellow, true)
+	case core.ScanSecuritySeverityLow:
+		return colorize(text, ansiCyan, true)
+	default:
+		return text
+	}
+}
+
+func colorize(s, code string, enabled bool) string {
+	if !enabled || strings.TrimSpace(code) == "" || s == "" {
+		return s
+	}
+	return "\x1b[" + code + "m" + s + ansiReset
 }
 
 func formatDurationCompact(d time.Duration) string {

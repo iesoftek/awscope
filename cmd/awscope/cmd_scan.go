@@ -35,6 +35,8 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 		targetSeconds                int
 		awsMaxAttempts               int
 		awsRetryMode                 string
+		securityView                 string
+		securityColor                string
 	)
 	cmd := &cobra.Command{
 		Use:   "scan",
@@ -158,6 +160,18 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 			fmt.Printf("scan complete: account=%s partition=%s resources=%d edges=%d db=%s\n",
 				res.AccountID, res.Partition, res.Resources, res.Edges, st.DBPath())
 			fmt.Println(formatDetailedScanSummary(res))
+			showSecurityDetails, err := parseSecurityDetailView(securityView)
+			if err != nil {
+				return err
+			}
+			securityColorEnabled, err := resolveColorEnabled(securityColor, cmd.OutOrStdout())
+			if err != nil {
+				return err
+			}
+			fmt.Println(formatSecuritySummaryWithOptions(res.Summary.Security, securitySummaryFormatOptions{
+				ShowDetails: showSecurityDetails,
+				Color:       securityColorEnabled,
+			}))
 			fmt.Println(formatScanPerformanceSummary(res))
 			if plain && len(res.StepFailures) > 0 {
 				fmt.Printf("errors (%d):\n", len(res.StepFailures))
@@ -194,5 +208,7 @@ func newScanCmd(dbPath *string, offline *bool) *cobra.Command {
 	cmd.Flags().IntVar(&targetSeconds, "target-seconds", intEnvOr("AWSCOPE_SCAN_TARGET_SECONDS", 60), "Scan target duration in seconds (reporting only)")
 	cmd.Flags().IntVar(&awsMaxAttempts, "aws-max-attempts", intEnvOr("AWS_MAX_ATTEMPTS", 0), "Override AWS SDK max retry attempts for this scan (0 keeps SDK default)")
 	cmd.Flags().StringVar(&awsRetryMode, "aws-retry-mode", strings.TrimSpace(os.Getenv("AWS_RETRY_MODE")), "Override AWS SDK retry mode for this scan (standard|adaptive)")
+	cmd.Flags().StringVar(&securityView, "security-view", "summary", "Security findings detail view: summary|detailed")
+	cmd.Flags().StringVar(&securityColor, "security-color", "auto", "Security findings color mode: auto|always|never")
 	return cmd
 }

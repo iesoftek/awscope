@@ -73,10 +73,44 @@ type ScanPricingSummary struct {
 	Currency     string
 }
 
+type ScanSecuritySeverity string
+
+const (
+	ScanSecuritySeverityCritical ScanSecuritySeverity = "critical"
+	ScanSecuritySeverityHigh     ScanSecuritySeverity = "high"
+	ScanSecuritySeverityMedium   ScanSecuritySeverity = "medium"
+	ScanSecuritySeverityLow      ScanSecuritySeverity = "low"
+)
+
+type ScanSecurityFinding struct {
+	CheckID       string
+	Severity      ScanSecuritySeverity
+	Title         string
+	Service       string
+	ControlRef    string
+	GuidanceURL   string
+	AffectedCount int
+	Regions       []string
+	Samples       []string
+}
+
+type ScanSecurityCoverage struct {
+	AssessedChecks  int
+	SkippedChecks   int
+	MissingServices []string
+}
+
+type ScanSecuritySummary struct {
+	Findings           []ScanSecurityFinding
+	AffectedBySeverity map[ScanSecuritySeverity]int
+	Coverage           ScanSecurityCoverage
+}
+
 type ScanSummary struct {
 	ServiceCounts    []ScanServiceCount
 	ImportantRegions []ScanRegionCount
 	Pricing          ScanPricingSummary
+	Security         ScanSecuritySummary
 }
 
 type ScanResult struct {

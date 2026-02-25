@@ -21,6 +21,7 @@ import (
 	"awscope/internal/pricing"
 	"awscope/internal/providers"
 	"awscope/internal/providers/registry"
+	"awscope/internal/security"
 	"awscope/internal/store"
 
 	"golang.org/x/sync/errgroup"
@@ -126,6 +127,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 	var failures []ScanStepFailure
 	serviceCounts := map[string]int{}
 	regionCounts := map[string]int{}
+	var securityNodes []graph.ResourceNode
 
 	stepSummary := func(providerID string, nodes []graph.ResourceNode, edges []graph.RelationshipEdge) (typeCounts map[string]int, sampleLabel string, sampleTotal int, sampleItems []string) {
 		typeCounts = map[string]int{}
@@ -288,6 +290,7 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 
 			atomic.AddInt64(&nodesSoFar, int64(len(r.res.Nodes)))
 			atomic.AddInt64(&edgesSoFar, int64(len(r.res.Edges)))
+			securityNodes = append(securityNodes, r.res.Nodes...)
 
 			scopeRegions := successfulScopeRegions(r.task.scope, r.task.stepRegion, r.task.reqRegions)
 			if len(scopeRegions) > 0 {
@@ -1025,6 +1028,13 @@ func (a *App) ScanWithProgress(ctx context.Context, opts ScanOptions, progress S
 			Currency: "USD",
 		},
 	}
+
+	summary.Security = ScanSecuritySummaryFromEvaluator(security.Evaluate(security.EvaluateInput{
+		Nodes:           securityNodes,
+		SelectedRegions: opts.Regions,
+		ScannedServices: opts.ProviderIDs,
+		MaxKeyAgeDays:   envIntOr("AWSCOPE_SECURITY_MAX_KEY_AGE_DAYS", 90),
+	}))
 
 	if len(serviceCounts) > 0 {
 		summary.ServiceCounts = make([]ScanServiceCount, 0, len(serviceCounts))
