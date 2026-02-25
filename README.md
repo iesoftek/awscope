@@ -299,3 +299,12 @@ Run tests:
 ```sh
 go test ./...
 ```
+
+Architecture and contributor docs:
+
+- `docs/ARCHITECTURE.md`
+- `docs/CODE_STRUCTURE.md`
+- `docs/DEVELOPMENT.md`
+- `docs/adr/ADR-0001-layer-boundaries.md`
+- `docs/adr/ADR-0002-service-catalog.md`
+- `docs/adr/ADR-0003-scan-stage-pipeline.md`
