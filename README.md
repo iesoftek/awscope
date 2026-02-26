@@ -2,6 +2,11 @@
 
 AWS inventory scanner + interactive TUI for browsing resources and relationships.
 
+
+<img width="1024" height="506" alt="image" src="https://github.com/user-attachments/assets/5f93bb55-9956-438f-b339-aef632cc7765" />
+
+
+
 ## Highlights
 
 - Scan AWS accounts into a local SQLite inventory (`awscope scan`)
