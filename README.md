@@ -31,8 +31,13 @@ case "${ARCH}" in
   arm64|aarch64) ARCH="arm64" ;;
   *) echo "unsupported arch: ${ARCH}" && exit 1 ;;
 esac
-curl -fsSL -o awscope.tar.gz "https://github.com/iesoftek/awscope/releases/download/v${VERSION}/awscope_${VERSION}_${OS}_${ARCH}.tar.gz"
-tar -xzf awscope.tar.gz
+if [ "${OS}" = "darwin" ]; then
+  curl -fsSL -o awscope.zip "https://github.com/iesoftek/awscope/releases/download/v${VERSION}/awscope_${VERSION}_darwin_${ARCH}.zip"
+  unzip -o awscope.zip
+else
+  curl -fsSL -o awscope.tar.gz "https://github.com/iesoftek/awscope/releases/download/v${VERSION}/awscope_${VERSION}_${OS}_${ARCH}.tar.gz"
+  tar -xzf awscope.tar.gz
+fi
 ./awscope version
 ```
 
@@ -51,9 +56,18 @@ brew install --cask awscope
 - A release-published workflow builds and uploads cross-platform archives:
   - `linux/amd64`
   - `linux/arm64`
-  - `darwin/amd64`
-  - `darwin/arm64`
+  - `darwin/amd64` (signed + notarized zip)
+  - `darwin/arm64` (signed + notarized zip)
 - The same workflow updates the Homebrew cask in `iesoftek/homebrew-tap`.
+
+Required secrets for macOS notarization in GitHub Actions:
+
+- `APPLE_CERT_P12_BASE64`: base64-encoded Developer ID Application `.p12`
+- `APPLE_CERT_PASSWORD`: password for the `.p12`
+- `APPLE_CODESIGN_IDENTITY`: signing identity name (for example `Developer ID Application: Example, Inc. (TEAMID)`)
+- `APPLE_API_KEY_ID`: App Store Connect API key ID
+- `APPLE_API_ISSUER_ID`: App Store Connect API issuer UUID
+- `APPLE_API_KEY_P8_BASE64`: base64-encoded App Store Connect `.p8` private key
 
 ## PR Title Convention
 

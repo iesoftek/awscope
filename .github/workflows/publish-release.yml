@@ -12,21 +12,15 @@ env:
   BINARY_NAME: awscope
 
 jobs:
-  build-artifacts:
-    name: build-${{ matrix.goos }}-${{ matrix.goarch }}
+  build-linux-artifacts:
+    name: build-linux-${{ matrix.goarch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
+        goarch:
+          - amd64
+          - arm64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,7 +48,6 @@ jobs:
 
       - name: Build archive
         env:
-          GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           VERSION: ${{ steps.meta.outputs.version }}
           COMMIT: ${{ steps.meta.outputs.commit }}
@@ -62,26 +55,159 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
+          CGO_ENABLED=0 GOOS="linux" GOARCH="$GOARCH" \
             go build -trimpath \
             -ldflags "-s -w -X awscope/internal/buildinfo.Version=v${VERSION} -X awscope/internal/buildinfo.Commit=${COMMIT} -X awscope/internal/buildinfo.Date=${PUBLISHED_AT}" \
             -o "dist/${BINARY_NAME}" \
             ./cmd/awscope
-          archive="${BINARY_NAME}_${VERSION}_${GOOS}_${GOARCH}.tar.gz"
+          archive="${BINARY_NAME}_${VERSION}_linux_${GOARCH}.tar.gz"
           tar -C dist -czf "dist/${archive}" "${BINARY_NAME}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: artifact-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: artifact-linux-${{ matrix.goarch }}
           path: dist/*.tar.gz
           if-no-files-found: error
+
+  build-macos-notarized:
+    name: notarize-macos-${{ matrix.goarch }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch:
+          - amd64
+          - arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Compute build metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.release.tag_name }}"
+          version="${tag#v}"
+          git fetch --force --tags
+          commit="$(git rev-list -n 1 "$tag")"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "commit=$commit" >>"$GITHUB_OUTPUT"
+          echo "published_at=${{ github.event.release.published_at }}" >>"$GITHUB_OUTPUT"
+
+      - name: Validate notarization secrets
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for key in APPLE_CERT_P12_BASE64 APPLE_CERT_PASSWORD APPLE_CODESIGN_IDENTITY APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64; do
+            if [ -z "${!key:-}" ]; then
+              missing+=("$key")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "Missing required secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Import signing certificate
+        env:
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT_PATH="$RUNNER_TEMP/signing-cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          echo "$APPLE_CERT_P12_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed 's/[ "]//g')
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "" "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Prepare notary API key
+        id: notary-key
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/private_keys"
+          key_path="$RUNNER_TEMP/private_keys/AuthKey_${APPLE_API_KEY_ID}.p8"
+          echo "$APPLE_API_KEY_P8_BASE64" | base64 --decode > "$key_path"
+          chmod 600 "$key_path"
+          echo "path=$key_path" >>"$GITHUB_OUTPUT"
+
+      - name: Build and sign macOS binary
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT: ${{ steps.meta.outputs.commit }}
+          PUBLISHED_AT: ${{ steps.meta.outputs.published_at }}
+          APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=darwin GOARCH="$GOARCH" \
+            go build -trimpath \
+            -ldflags "-s -w -X awscope/internal/buildinfo.Version=v${VERSION} -X awscope/internal/buildinfo.Commit=${COMMIT} -X awscope/internal/buildinfo.Date=${PUBLISHED_AT}" \
+            -o "dist/${BINARY_NAME}" \
+            ./cmd/awscope
+          codesign --force --timestamp --options runtime --sign "$APPLE_CODESIGN_IDENTITY" "dist/${BINARY_NAME}"
+          codesign --verify --deep --strict --verbose=2 "dist/${BINARY_NAME}"
+          zip_name="${BINARY_NAME}_${VERSION}_darwin_${GOARCH}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "dist/${BINARY_NAME}" "dist/${zip_name}"
+
+      - name: Notarize archive
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          zip_name="${BINARY_NAME}_${VERSION}_darwin_${GOARCH}.zip"
+          xcrun notarytool submit "dist/${zip_name}" \
+            --key "${{ steps.notary-key.outputs.path }}" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifact-darwin-${{ matrix.goarch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+      - name: Cleanup temporary keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
 
   publish-assets:
     name: publish-assets
     runs-on: ubuntu-latest
     needs:
-      - build-artifacts
+      - build-linux-artifacts
+      - build-macos-notarized
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -99,16 +225,18 @@ jobs:
           mkdir -p release-assets
           checksums_file="release-assets/${BINARY_NAME}_${version}_checksums.txt"
           : >"$checksums_file"
+          count=0
 
           while IFS= read -r file; do
             base="$(basename "$file")"
             sha="$(sha256sum "$file" | awk '{print $1}')"
             printf "%s  %s\n" "$sha" "$base" >>"$checksums_file"
             cp "$file" "release-assets/${base}"
-          done < <(find artifacts -type f -name "${BINARY_NAME}_${version}_*.tar.gz" | sort)
+            count=$((count + 1))
+          done < <(find artifacts -type f \( -name "${BINARY_NAME}_${version}_linux_*.tar.gz" -o -name "${BINARY_NAME}_${version}_darwin_*.zip" \) | sort)
 
-          if [ ! -s "$checksums_file" ]; then
-            echo "No release archives found for ${version}" >&2
+          if [ "$count" -ne 4 ]; then
+            echo "Expected 4 release archives (2 linux tar.gz + 2 darwin zip), found ${count}" >&2
             exit 1
           fi
 
@@ -119,6 +247,7 @@ jobs:
           overwrite_files: true
           files: |
             release-assets/*.tar.gz
+            release-assets/*.zip
             release-assets/*.txt
 
   update-homebrew:
@@ -140,11 +269,11 @@ jobs:
           gh release download "$tag" \
             --repo "${{ github.repository }}" \
             --dir dist \
-            --pattern "${BINARY_NAME}_${version}_darwin_amd64.tar.gz" \
-            --pattern "${BINARY_NAME}_${version}_darwin_arm64.tar.gz"
+            --pattern "${BINARY_NAME}_${version}_darwin_amd64.zip" \
+            --pattern "${BINARY_NAME}_${version}_darwin_arm64.zip"
 
-          amd64_sha="$(sha256sum "dist/${BINARY_NAME}_${version}_darwin_amd64.tar.gz" | awk '{print $1}')"
-          arm64_sha="$(sha256sum "dist/${BINARY_NAME}_${version}_darwin_arm64.tar.gz" | awk '{print $1}')"
+          amd64_sha="$(sha256sum "dist/${BINARY_NAME}_${version}_darwin_amd64.zip" | awk '{print $1}')"
+          arm64_sha="$(sha256sum "dist/${BINARY_NAME}_${version}_darwin_arm64.zip" | awk '{print $1}')"
 
           echo "version=$version" >>"$GITHUB_OUTPUT"
           echo "amd64_sha=$amd64_sha" >>"$GITHUB_OUTPUT"
@@ -170,12 +299,12 @@ cask "awscope" do
 
   on_arm do
     sha256 "${ARM64_SHA}"
-    url "https://github.com/iesoftek/awscope/releases/download/v#{version}/awscope_#{version}_darwin_arm64.tar.gz"
+    url "https://github.com/iesoftek/awscope/releases/download/v#{version}/awscope_#{version}_darwin_arm64.zip"
   end
 
   on_intel do
     sha256 "${AMD64_SHA}"
-    url "https://github.com/iesoftek/awscope/releases/download/v#{version}/awscope_#{version}_darwin_amd64.tar.gz"
+    url "https://github.com/iesoftek/awscope/releases/download/v#{version}/awscope_#{version}_darwin_amd64.zip"
   end
 
   name "awscope"
