@@ -107,10 +107,10 @@ var serviceSpecs = map[string]ServiceSpec{
 	"ecs": {
 		ID:            "ecs",
 		DisplayName:   "ECS",
-		DefaultType:   "ecs:service",
-		FallbackTypes: []string{"ecs:service", "ecs:cluster", "ecs:task", "ecs:task-definition"},
-		SampleType:    "ecs:service",
-		SampleLabel:   "services",
+		DefaultType:   "ecs:cluster",
+		FallbackTypes: []string{"ecs:cluster", "ecs:service", "ecs:task", "ecs:task-definition"},
+		SampleType:    "ecs:cluster",
+		SampleLabel:   "clusters",
 	},
 	"efs": {
 		ID:            "efs",

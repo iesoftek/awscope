@@ -4,12 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"runtime/debug"
 	"sort"
 	"strings"
 
 	"awscope/internal/aws"
+	"awscope/internal/buildinfo"
 	"awscope/internal/catalog"
+	"awscope/internal/core"
 	"awscope/internal/providers/registry"
 	"awscope/internal/store"
 	"awscope/internal/tui/components/graphlens"
@@ -22,6 +23,8 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/paginator"
+	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -118,6 +121,7 @@ func Run(ctx context.Context, st *store.Store, opts Options) error {
 	m := model{
 		ctx:              ctx,
 		st:               st,
+		scanner:          core.New(st),
 		dbPath:           st.DBPath(),
 		offline:          st.Offline(),
 		build:            buildLabel(),
@@ -155,6 +159,12 @@ func Run(ctx context.Context, st *store.Store, opts Options) error {
 		actionStreamWrap:          true,
 		actionStreamColorize:      true,
 		actionStreamMaxBytes:      defaultActionStreamMaxBytes,
+		refreshActiveStepKeys:     map[string]string{},
+		refreshFailureStepKeys:    map[string]bool{},
+		refreshBusyServiceCounts:  map[string]int{},
+		refreshBusyServices:       map[string]bool{},
+		refreshSpinner:            spinner.New(spinner.WithSpinner(spinner.Points)),
+		refreshProgress:           progress.New(progress.WithDefaultGradient()),
 		related:                   relatedList,
 		raw:                       viewport.New(30, 10),
 		actions:                   actionsList,
@@ -172,7 +182,7 @@ func Run(ctx context.Context, st *store.Store, opts Options) error {
 			Filter:        key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
 			Regions:       key.NewBinding(key.WithKeys("R"), key.WithHelp("R", "regions")),
 			Actions:       key.NewBinding(key.WithKeys("A"), key.WithHelp("A", "actions")),
-			Refresh:       key.NewBinding(key.WithKeys("ctrl+r"), key.WithHelp("ctrl+r", "refresh")),
+			Refresh:       key.NewBinding(key.WithKeys("ctrl+r"), key.WithHelp("ctrl+r", "refresh scope")),
 			Theme:         key.NewBinding(key.WithKeys("T"), key.WithHelp("T", "theme")),
 			Graph:         key.NewBinding(key.WithKeys("g"), key.WithHelp("g", "graph")),
 			Audit:         key.NewBinding(key.WithKeys("E"), key.WithHelp("E", "audit")),
@@ -270,24 +280,5 @@ func effectiveProfile(in string) string {
 }
 
 func buildLabel() string {
-	info, ok := debug.ReadBuildInfo()
-	if ok && info != nil {
-		var rev string
-		for _, s := range info.Settings {
-			if s.Key == "vcs.revision" {
-				rev = s.Value
-				break
-			}
-		}
-		if rev != "" {
-			if len(rev) > 12 {
-				rev = rev[:12]
-			}
-			return rev
-		}
-		if v := strings.TrimSpace(info.Main.Version); v != "" {
-			return v
-		}
-	}
-	return "dev"
+	return buildinfo.Label()
 }

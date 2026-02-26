@@ -10,6 +10,7 @@ import (
 
 	"awscope/internal/aws"
 	"awscope/internal/catalog"
+	"awscope/internal/core"
 	"awscope/internal/graph"
 	"awscope/internal/store"
 	"awscope/internal/tui/components/graphlens"
@@ -20,6 +21,8 @@ import (
 	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/paginator"
+	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -71,6 +74,25 @@ type auditFilters struct {
 	OnlyErrors bool
 }
 
+type ecsDrillLevel int
+
+const (
+	ecsDrillNone ecsDrillLevel = iota
+	ecsDrillServices
+	ecsDrillTasks
+)
+
+type ecsDrillState struct {
+	Level       ecsDrillLevel
+	ClusterKey  graph.ResourceKey
+	ClusterArn  string
+	ClusterName string
+	ServiceKey  graph.ResourceKey
+	ServiceArn  string
+	ServiceName string
+	Region      string
+}
+
 type navFrame struct {
 	service     string
 	typ         string
@@ -88,11 +110,13 @@ type navFrame struct {
 	lensInCursor    int
 	lensOutCursor   int
 	lensExpanded    []string
+	ecsDrill        ecsDrillState
 }
 
 type model struct {
-	ctx context.Context
-	st  *store.Store
+	ctx     context.Context
+	st      *store.Store
+	scanner scanRunner
 
 	dbPath  string
 	offline bool
@@ -131,6 +155,7 @@ type model struct {
 	selectedType    string
 	selectedRegions map[string]bool
 	knownRegions    []string
+	ecsDrill        ecsDrillState
 
 	resourceSummaries []store.ResourceSummary
 	totalResources    int
@@ -194,6 +219,25 @@ type model struct {
 	actionStreamRenderWidth int
 	actionStreamMaxBytes    int
 
+	refreshActive            bool
+	refreshSeq               int
+	refreshScope             refreshScope
+	refreshStartedAt         time.Time
+	refreshCancel            context.CancelFunc
+	refreshCh                <-chan tea.Msg
+	refreshCurrent           core.ScanProgressEvent
+	refreshTotal             int
+	refreshCompleted         int
+	refreshResSoFar          int
+	refreshEdgesSoFar        int
+	refreshStepFailures      int
+	refreshActiveStepKeys    map[string]string
+	refreshFailureStepKeys   map[string]bool
+	refreshBusyServiceCounts map[string]int
+	refreshBusyServices      map[string]bool
+	refreshSpinner           spinner.Model
+	refreshProgress          progress.Model
+
 	graphMode    bool
 	graphRootKey graph.ResourceKey
 
@@ -241,6 +285,24 @@ type filterSnapshot struct {
 	Resource   string
 	Regions    string
 	RegionFind string
+}
+
+const (
+	frameTopBarLines        = 4
+	frameStatusReserved     = 2
+	frameBodyStatusGapLines = 1
+)
+
+func (m model) frameBodyHeightBudget() int {
+	if m.height <= 0 {
+		return 0
+	}
+	reserved := frameTopBarLines + frameStatusReserved + frameBodyStatusGapLines
+	return max(6, m.height-reserved)
+}
+
+func (m model) paneInnerHeightBudget() int {
+	return max(4, m.frameBodyHeightBudget()-3) // pane header + top/bottom border
 }
 
 func (m model) filters() filterSnapshot {
@@ -368,6 +430,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showHelp = false
 				m.help.ShowAll = false
 			case "q", "ctrl+c":
+				m.stopRefreshScan()
 				return m, tea.Quit
 			}
 			return m, nil
@@ -392,6 +455,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		k := msg.String()
 		switch k {
 		case "q", "ctrl+c":
+			m.stopRefreshScan()
 			return m, tea.Quit
 
 		case "?":
@@ -531,6 +595,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.regionFilterOn = false
 				m.regionFilter.Blur()
+				m.clearECSDrillIfRegionOutOfScope()
 				m.loading = true
 				m.err = nil
 				m.pager.Page = 0
@@ -623,6 +688,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.regionFilterOn = false
 				m.regionFilter.Blur()
+				m.clearECSDrillIfRegionOutOfScope()
 				m.loading = true
 				m.err = nil
 				m.pager.Page = 0
@@ -758,6 +824,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.regionFilterOn = false
 				m.regionFilter.Blur()
+				m.clearECSDrillIfRegionOutOfScope()
 				m.loading = true
 				m.err = nil
 				m.pager.Page = 0
@@ -854,6 +921,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "left", "h":
+			if m.focus == focusResources && !m.graphMode && m.selectedService == "ecs" {
+				if cmd := m.drillECSUpCmd(); cmd != nil {
+					cmds = append(cmds, cmd)
+					break
+				}
+			}
 			if m.focus == focusResources && m.graphMode {
 				m.lens.FocusLeft()
 				break
@@ -874,6 +947,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "right", "l":
+			if m.focus == focusResources && !m.graphMode && m.selectedService == "ecs" {
+				if cmd := m.drillECSDownCmd(); cmd != nil {
+					cmds = append(cmds, cmd)
+					break
+				}
+			}
 			if m.focus == focusResources && m.graphMode {
 				m.lens.FocusRight()
 				break
@@ -923,23 +1002,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "ctrl+r":
-			m.loading = true
-			m.err = nil
-			if !m.offline {
-				m.identityLoading = true
-				m.identityErr = nil
+			if m.offline {
+				m.loading = true
+				m.err = nil
+				cmds = append(cmds, m.loadIdentityCmd(), m.loadRegionsCmd(), m.loadRegionCountsCmd(), m.loadServiceCountsCmd(), m.loadTypeCountsCmd(m.nav.ExpandedService()), m.loadResourcesCmd(), m.loadNeighborsCmd())
+				if m.pricingMode {
+					cmds = append(cmds, m.loadServiceCostAggCmd(), m.loadTypeCostAggCmd(m.nav.ExpandedService()))
+				}
+				if m.auditOpen {
+					m.auditLoading = true
+					m.auditFilters.Text = strings.TrimSpace(m.auditFilter.Value())
+					m.resetAuditPaging()
+					m.clearAuditPageCache()
+					seq := m.nextAuditSeq()
+					cmds = append(cmds, tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)))
+				}
+				break
 			}
-			cmds = append(cmds, m.loadIdentityCmd(), m.loadRegionsCmd(), m.loadRegionCountsCmd(), m.loadServiceCountsCmd(), m.loadTypeCountsCmd(m.nav.ExpandedService()), m.loadResourcesCmd(), m.loadNeighborsCmd())
-			if m.pricingMode {
-				cmds = append(cmds, m.loadServiceCostAggCmd(), m.loadTypeCostAggCmd(m.nav.ExpandedService()))
+			if m.refreshActive {
+				m.statusLine = "refresh already running"
+				break
 			}
-			if m.auditOpen {
-				m.auditLoading = true
-				m.auditFilters.Text = strings.TrimSpace(m.auditFilter.Value())
-				m.resetAuditPaging()
-				m.clearAuditPageCache()
-				seq := m.nextAuditSeq()
-				cmds = append(cmds, tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)))
+			if cmd := m.startRefreshForCurrentScopeCmd(); cmd != nil {
+				cmds = append(cmds, cmd)
 			}
 
 		case " ":
@@ -1257,42 +1342,45 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 
+	case refreshProgressMsg, refreshDoneMsg, refreshClosedMsg:
+		if cmd := m.handleRefreshMessage(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		w := msg.Width
-		h := msg.Height
 		left, mid, right := computePaneWidths(w)
 		m.paneLeftW, m.paneMidW, m.paneRightW = left, mid, right
 
-		// Keep one line for the statusbar at the bottom.
-		usableH := max(10, h-8)
-		m.nav.SetSize(max(10, left-4), max(4, usableH-2))
+		bodyH := m.frameBodyHeightBudget()
+		paneInnerH := m.paneInnerHeightBudget()
+		m.nav.SetSize(max(10, left-4), paneInnerH)
 
 		m.resources.SetWidth(mid - 4)
-		m.resources.SetHeight(h - 8)
-		m.regions.SetSize(mid, min(12, h-8))
-		m.actions.SetSize(mid, min(10, h-8))
-		m.related.SetSize(max(10, right-4), h-8)
+		m.regions.SetSize(mid, min(12, max(6, bodyH-2)))
+		m.actions.SetSize(mid, min(10, max(6, bodyH-2)))
+		m.related.SetSize(max(10, right-4), paneInnerH)
 		m.raw.Width = max(10, right-4)
-		m.raw.Height = h - 8
+		m.raw.Height = paneInnerH
 		m.help.Width = w
 		m.statusbar, _ = m.statusbar.Update(msg)
 
 		m.applyResourceTableLayout(mid-4, m.resourceSummaries)
 		m.regionTable.SetWidth(mid - 4)
-		m.regionTable.SetHeight(max(6, h-12))
+		m.regionTable.SetHeight(max(6, bodyH-4))
 		m.regionTable.SetColumns(buildRegionColumns(mid - 4))
 		m.regionFilter.Width = min(30, max(10, mid-16))
 		m.resizeAuditWidgets()
 		m.resizeActionStreamWidgets()
 		// Graph Lens side lists are sized dynamically in View(), but we still update height here.
-		lensH := max(4, h-11)
+		lensH := max(4, paneInnerH-1)
 		sideW := max(12, (mid-10)/3)
 		m.lens.SetSize(sideW, sideW, lensH)
 
 		// Match page size to viewport height as a reasonable default for paging.
-		perPage := max(10, h-10)
+		perPage := max(10, paneInnerH-2)
 		if perPage != m.pager.PerPage {
 			m.pager.PerPage = perPage
 			m.pager.Page = 0
@@ -1300,7 +1388,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = nil
 			cmds = append(cmds, m.loadResourcesCmd())
 		}
+
+	case spinner.TickMsg:
+		if m.refreshActive {
+			var cmd tea.Cmd
+			m.refreshSpinner, cmd = m.refreshSpinner.Update(msg)
+			if glyph := strings.TrimSpace(m.refreshSpinner.View()); glyph != "" {
+				m.nav.SetBusyServices(m.refreshBusyServices, glyph)
+			}
+			cmds = append(cmds, cmd)
+		}
 	}
+
+	m.syncResourceHeight()
 
 	// Bubble components with internal focus state must be toggled explicitly.
 	if m.focus == focusResources && !m.graphMode {
@@ -1349,6 +1449,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.selectedType == "" {
 						m.selectedType = defaultTypeForService(after.Service)
 					}
+					m.applyECSSelection(m.selectedService, m.selectedType, false)
 					m.nav.SetSelection(m.selectedService, m.selectedType)
 					m.applyServiceScope()
 					m.rebuildRegionTable("")
@@ -1375,6 +1476,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if after.Service != "" && after.Type != "" && (after.Service != m.selectedService || after.Type != m.selectedType) {
 					m.selectedService = after.Service
 					m.selectedType = after.Type
+					m.applyECSSelection(m.selectedService, m.selectedType, true)
 					m.nav.SetSelection(m.selectedService, m.selectedType)
 					m.applyServiceScope()
 					m.rebuildRegionTable("")
@@ -1832,17 +1934,24 @@ func (m *model) handleAuditKey(msg tea.KeyMsg) (tea.Cmd, bool) {
 		}
 		return nil, true
 	case "ctrl+r":
-		if m.focus == focusAuditFilter {
-			m.focus = focusAudit
-			m.auditFilter.Blur()
+		if m.offline {
+			if m.focus == focusAuditFilter {
+				m.focus = focusAudit
+				m.auditFilter.Blur()
+			}
+			m.auditMode = auditModeList
+			m.auditLoading = true
+			m.auditFilters.Text = strings.TrimSpace(m.auditFilter.Value())
+			m.resetAuditPaging()
+			m.clearAuditPageCache()
+			seq := m.nextAuditSeq()
+			return tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)), true
 		}
-		m.auditMode = auditModeList
-		m.auditLoading = true
-		m.auditFilters.Text = strings.TrimSpace(m.auditFilter.Value())
-		m.resetAuditPaging()
-		m.clearAuditPageCache()
-		seq := m.nextAuditSeq()
-		return tea.Batch(m.loadAuditFirstPageCmd(seq), m.loadAuditCountCmd(seq), m.loadAuditFacetsCmd(seq)), true
+		if m.refreshActive {
+			m.statusLine = "refresh already running"
+			return nil, true
+		}
+		return m.startRefreshForCurrentScopeCmd(), true
 	}
 
 	if m.focus != focusAudit {

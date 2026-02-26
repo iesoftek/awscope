@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
-	"runtime/debug"
 
+	"awscope/internal/buildinfo"
 	"github.com/spf13/cobra"
 )
 
@@ -12,38 +12,20 @@ func newVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print version information",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if info, ok := debug.ReadBuildInfo(); ok && info != nil {
-				fmt.Printf("awscope %s\n", info.Main.Version)
-				var (
-					rev      string
-					vcsTime  string
-					modified string
-				)
-				for _, s := range info.Settings {
-					switch s.Key {
-					case "vcs.revision":
-						rev = s.Value
-					case "vcs.time":
-						vcsTime = s.Value
-					case "vcs.modified":
-						modified = s.Value
-					}
-				}
-				if rev != "" {
-					fmt.Printf("revision: %s\n", rev)
-				}
-				if vcsTime != "" {
-					fmt.Printf("time: %s\n", vcsTime)
-				}
-				if modified != "" {
-					fmt.Printf("modified: %s\n", modified)
-				}
-				if info.GoVersion != "" {
-					fmt.Printf("go: %s\n", info.GoVersion)
-				}
-				return nil
+			info := buildinfo.Read()
+			fmt.Printf("awscope %s\n", info.Version)
+			if info.Commit != "" {
+				fmt.Printf("revision: %s\n", info.Commit)
 			}
-			fmt.Println("awscope dev")
+			if info.Date != "" {
+				fmt.Printf("time: %s\n", info.Date)
+			}
+			if info.Modified != "" {
+				fmt.Printf("modified: %s\n", info.Modified)
+			}
+			if info.GoVersion != "" {
+				fmt.Printf("go: %s\n", info.GoVersion)
+			}
 			return nil
 		},
 	}

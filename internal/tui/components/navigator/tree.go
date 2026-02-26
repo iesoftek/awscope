@@ -62,6 +62,9 @@ type Model struct {
 	styles Styles
 
 	icons icons.Set
+
+	busyServices map[string]bool
+	busyGlyph    string
 }
 
 type Styles struct {
@@ -92,6 +95,7 @@ func New(services []string, fallbackTypes func(service string) []string) Model {
 		fallbackTypes:       fallbackTypes,
 		styles:              Styles{},
 		icons:               icons.New(icons.ModeNerd),
+		busyServices:        map[string]bool{},
 	}
 	sort.Strings(m.services)
 	m.rebuild()
@@ -104,7 +108,12 @@ func (m *Model) SetSize(width, height int) {
 
 func (m *Model) SetStyles(s Styles) {
 	m.styles = s
-	m.list.SetDelegate(treeDelegate{styles: s, icons: m.icons})
+	m.list.SetDelegate(treeDelegate{
+		styles:       s,
+		icons:        m.icons,
+		busyServices: m.busyServices,
+		busyGlyph:    m.busyGlyph,
+	})
 }
 
 func (m *Model) SetIcons(set icons.Set) {
@@ -112,7 +121,31 @@ func (m *Model) SetIcons(set icons.Set) {
 		return
 	}
 	m.icons = set
-	m.list.SetDelegate(treeDelegate{styles: m.styles, icons: set})
+	m.list.SetDelegate(treeDelegate{
+		styles:       m.styles,
+		icons:        set,
+		busyServices: m.busyServices,
+		busyGlyph:    m.busyGlyph,
+	})
+}
+
+func (m *Model) SetBusyServices(busy map[string]bool, glyph string) {
+	next := map[string]bool{}
+	for svc, on := range busy {
+		svc = strings.TrimSpace(svc)
+		if svc == "" || !on {
+			continue
+		}
+		next[svc] = true
+	}
+	m.busyServices = next
+	m.busyGlyph = strings.TrimSpace(glyph)
+	m.list.SetDelegate(treeDelegate{
+		styles:       m.styles,
+		icons:        m.icons,
+		busyServices: m.busyServices,
+		busyGlyph:    m.busyGlyph,
+	})
 }
 
 func (m *Model) SetServiceCounts(rows []store.ServiceCount) {
@@ -370,6 +403,9 @@ func (m *Model) selectCurrent() {
 type treeDelegate struct {
 	styles Styles
 	icons  icons.Set
+
+	busyServices map[string]bool
+	busyGlyph    string
 }
 
 func (d treeDelegate) Height() int                             { return 1 }
@@ -405,7 +441,10 @@ func (d treeDelegate) Render(w io.Writer, m list.Model, index int, li list.Item)
 			}
 		}
 		ico := ""
-		if d.icons != nil {
+		if d.busyServices != nil && d.busyServices[row.Service] {
+			ico = icons.Pad(d.busyGlyph, 2)
+		}
+		if ico == "" && d.icons != nil {
 			ico = icons.Pad(d.icons.Service(row.Service), 2)
 		}
 		plain := fmt.Sprintf("%s %s%s %d", arrow, ico, padTrunc(row.Service, 10), row.Count)

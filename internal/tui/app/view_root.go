@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func (m model) View() string {
@@ -70,10 +71,10 @@ func (m model) View() string {
 		}
 		detHeader = focusStyle.Render("Details (" + tab + ")")
 	}
-
-	filterLine := fmt.Sprintf("filter: %s", m.filter.View())
-	if m.auditOpen {
-		filterLine = fmt.Sprintf("audit: %s", m.auditFilter.View())
+	if !m.graphMode && strings.TrimSpace(m.selectedService) == "ecs" {
+		if crumb := m.ecsDrillBreadcrumb(); strings.TrimSpace(crumb) != "" {
+			resHeader += " " + m.styles.Dim.Render("• "+crumb)
+		}
 	}
 
 	leftBorder := m.styles.PaneBorder
@@ -87,10 +88,12 @@ func (m model) View() string {
 		rightBorder = m.styles.PaneBorderFocus
 	}
 
-	leftPane := leftBorder.Render(navHeader + "\n" + m.nav.View())
+	paneContentH := max(4, m.frameBodyHeightBudget()-2)
+	leftPaneStyle := leftBorder.Height(paneContentH)
 	if m.paneLeftW > 0 {
-		leftPane = leftBorder.Width(max(0, m.paneLeftW-2)).Render(navHeader + "\n" + m.nav.View())
+		leftPaneStyle = leftPaneStyle.Width(max(0, m.paneLeftW-2))
 	}
+	leftPane := leftPaneStyle.Render(navHeader + "\n" + m.nav.View())
 
 	// Center pane "overlay" pickers (regions/actions/confirm/help) should not add extra lines
 	// above the layout, otherwise the modal can scroll off-screen on small terminals.
@@ -125,6 +128,10 @@ func (m model) View() string {
 			"  space/enter: expand/collapse group",
 			"  enter: traverse neighbor (when selected)",
 			"  backspace: back",
+			"",
+			"ECS Drill (LIST mode):",
+			"  right: cluster -> services -> tasks",
+			"  left: tasks -> services -> clusters",
 			"",
 		}, "\n")
 		midView = extra + m.help.View(m.keys)
@@ -173,16 +180,23 @@ func (m model) View() string {
 			midView = lipgloss.JoinHorizontal(lipgloss.Top, inCol, card, outCol)
 		} else {
 			midView = m.resources.View()
+			if m.refreshStripVisible() {
+				stripW := max(20, m.paneMidW-4)
+				midView += "\n" + m.renderRefreshProgressStrip(stripW)
+			}
 		}
 	}
-	midPane := midBorder.Render(resHeader + "\n" + midView)
-	rightPane := rightBorder.Render(detHeader + "\n" + m.detailsView())
+	midPaneStyle := midBorder.Height(paneContentH)
 	if m.paneMidW > 0 {
-		midPane = midBorder.Width(max(0, m.paneMidW-2)).Render(resHeader + "\n" + midView)
+		midPaneStyle = midPaneStyle.Width(max(0, m.paneMidW-2))
 	}
+	midPane := midPaneStyle.Render(resHeader + "\n" + midView)
+	detailsBody := m.constrainDetailsBody(m.detailsView())
+	rightPaneStyle := rightBorder.Height(paneContentH)
 	if m.paneRightW > 0 {
-		rightPane = rightBorder.Width(max(0, m.paneRightW-2)).Render(detHeader + "\n" + m.detailsView())
+		rightPaneStyle = rightPaneStyle.Width(max(0, m.paneRightW-2))
 	}
+	rightPane := rightPaneStyle.Render(detHeader + "\n" + detailsBody)
 
 	row := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, midPane, rightPane)
 	metaW := lipgloss.Width(rightPane)
@@ -229,10 +243,7 @@ func (m model) View() string {
 	sb4 := status
 	m.statusbar.SetContent(sb1, sb2, sb3, sb4)
 
-	lines := []string{top, filterLine}
-	lines = append(lines, row)
-	lines = append(lines, m.statusbar.View())
-	return strings.Join(lines, "\n")
+	return m.composeFrame(top, "", row, m.statusbar.View())
 }
 
 func (m model) auditFullScreenView() string {
@@ -242,14 +253,6 @@ func (m model) auditFullScreenView() string {
 		metaW = max(44, min(72, m.width/2))
 	}
 	top := m.topBar(headerStyle, metaW)
-
-	filterVal := "(press /)"
-	if m.focus == focusAuditFilter {
-		filterVal = m.auditFilter.View()
-	} else if v := strings.TrimSpace(m.auditFilter.Value()); v != "" {
-		filterVal = v
-	}
-	filterLine := fmt.Sprintf("audit: %s", filterVal)
 
 	body := ""
 	if m.showHelp {
@@ -286,7 +289,7 @@ func (m model) auditFullScreenView() string {
 	sb4 := status
 	m.statusbar.SetContent(sb1, sb2, sb3, sb4)
 
-	return strings.Join([]string{top, filterLine, body, m.statusbar.View()}, "\n")
+	return m.composeFrame(top, "", body, m.statusbar.View())
 }
 
 func (m model) auditListView() string {
@@ -544,18 +547,43 @@ func focusName(f focus) string {
 }
 
 func (m model) topBar(headerStyle lipgloss.Style, metaOuterW int) string {
+	oneLine := func(s string) string {
+		s = strings.ReplaceAll(s, "\r", " ")
+		s = strings.ReplaceAll(s, "\n", " ")
+		s = strings.ReplaceAll(s, "\t", " ")
+		return strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+	}
+
+	themeName := "-"
+	if m.theme != nil {
+		themeName = string(m.theme.Theme().ID)
+	}
+	filterName := "filter"
+	filterValue := "-"
+	if m.auditOpen {
+		filterName = "audit"
+		if m.focus == focusAuditFilter {
+			filterValue = m.auditFilter.View()
+		} else if v := strings.TrimSpace(m.auditFilter.Value()); v != "" {
+			filterValue = v
+		}
+	} else {
+		if m.focus == focusFilter {
+			filterValue = m.filter.View()
+		} else if v := strings.TrimSpace(m.filter.Value()); v != "" {
+			filterValue = v
+		}
+	}
 	leftLines := []string{
 		headerStyle.Render("awscope"),
-		fmt.Sprintf("version: %s", m.build),
 		fmt.Sprintf("db: %s%s", m.dbPath, func() string {
 			if m.offline {
 				return " | offline"
 			}
 			return ""
 		}()),
-	}
-	if m.theme != nil {
-		leftLines = append(leftLines, fmt.Sprintf("theme: %s", m.theme.Theme().ID))
+		fmt.Sprintf("theme: %s", themeName),
+		fmt.Sprintf("%s: %s", filterName, filterValue),
 	}
 	left := strings.Join(leftLines, "\n")
 
@@ -589,10 +617,6 @@ func (m model) topBar(headerStyle lipgloss.Style, metaOuterW int) string {
 		mode = "GRAPH"
 	}
 	fs := m.filters()
-	filter := fs.Resource
-	if filter == "" {
-		filter = "-"
-	}
 	page := "-"
 	if m.auditOpen {
 		page = fmt.Sprintf("%d/%d", max(1, m.auditPageNum), max(1, m.auditPager.TotalPages))
@@ -637,7 +661,7 @@ func (m model) topBar(headerStyle lipgloss.Style, metaOuterW int) string {
 		if k != "" && !strings.HasSuffix(k, "=") {
 			k += "="
 		}
-		return lbl(k) + val(v)
+		return lbl(k) + val(oneLine(v))
 	}
 
 	line1 := strings.Join([]string{
@@ -659,7 +683,6 @@ func (m model) topBar(headerStyle lipgloss.Style, metaOuterW int) string {
 		kvInline("mode", mode),
 		kvInline("focus", focusName(m.focus)),
 		kvInline("page", page),
-		kvInline("filter", filter),
 	}
 	if m.focus == focusRegions {
 		rfind := fs.RegionFind
@@ -681,7 +704,7 @@ func (m model) topBar(headerStyle lipgloss.Style, metaOuterW int) string {
 	}
 	if innerW > 0 {
 		for i := range lines {
-			lines[i] = lipgloss.NewStyle().MaxWidth(innerW).Render(lines[i])
+			lines[i] = ansi.Truncate(lines[i], innerW, "")
 		}
 	}
 	metaText := strings.Join(lines, "\n")
@@ -704,8 +727,105 @@ func (m model) topBar(headerStyle lipgloss.Style, metaOuterW int) string {
 	if leftW < 0 {
 		leftW = 0
 	}
-	leftBlock := lipgloss.NewStyle().Width(leftW).Render(left)
+	leftParts := strings.Split(left, "\n")
+	for i := range leftParts {
+		leftParts[i] = ansi.Truncate(leftParts[i], leftW, "")
+	}
+	leftBlock := lipgloss.NewStyle().Width(leftW).Render(strings.Join(leftParts, "\n"))
 	return lipgloss.JoinHorizontal(lipgloss.Top, leftBlock, meta)
+}
+
+func (m model) composeFrame(top, filterLine, body, status string) string {
+	clamp := func(s string, oneLine bool) []string {
+		lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
+		if oneLine && len(lines) > 1 {
+			lines = lines[:1]
+		}
+		if m.width > 0 {
+			for i := range lines {
+				lines[i] = ansi.Truncate(lines[i], m.width, "")
+			}
+		}
+		if len(lines) == 0 {
+			return []string{""}
+		}
+		return lines
+	}
+
+	topLines := clamp(top, false)
+	filterLines := []string{}
+	if strings.TrimSpace(filterLine) != "" {
+		filterLines = clamp(filterLine, true)
+	}
+	statusLines := clamp(status, false)
+	bodyLines := clamp(body, false)
+	separatorLines := []string{}
+	if len(statusLines) > 0 {
+		separatorLines = []string{""}
+	}
+
+	if m.height > 0 {
+		reserved := len(topLines) + len(filterLines) + len(separatorLines) + len(statusLines)
+		availBody := m.height - reserved
+		if budget := m.frameBodyHeightBudget(); budget > 0 && availBody > budget {
+			availBody = budget
+		}
+		if availBody < 1 {
+			availBody = 1
+		}
+
+		if len(bodyLines) > availBody {
+			bodyLines = bodyLines[:availBody]
+		} else if len(bodyLines) < availBody {
+			pad := make([]string, availBody-len(bodyLines))
+			bodyLines = append(bodyLines, pad...)
+		}
+	}
+
+	out := make([]string, 0, len(topLines)+len(filterLines)+len(bodyLines)+len(statusLines))
+	out = append(out, topLines...)
+	out = append(out, filterLines...)
+	out = append(out, bodyLines...)
+	out = append(out, separatorLines...)
+	out = append(out, statusLines...)
+	return strings.Join(out, "\n")
+}
+
+func (m model) constrainDetailsBody(body string) string {
+	if strings.TrimSpace(body) == "" {
+		return body
+	}
+
+	// Keep right pane height stable and aligned with pane body budget so borders don't
+	// collide with the bottom status area.
+	maxBodyLines := m.paneInnerHeightBudget()
+	if maxBodyLines <= 0 {
+		maxBodyLines = max(4, m.height-10)
+	}
+	if maxBodyLines <= 0 {
+		return body
+	}
+
+	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
+	innerW := 0
+	if m.paneRightW > 0 {
+		innerW = max(10, m.paneRightW-4)
+	}
+	if innerW > 0 {
+		for i := range lines {
+			lines[i] = ansi.Truncate(lines[i], innerW, "…")
+		}
+	}
+
+	if len(lines) <= maxBodyLines {
+		return strings.Join(lines, "\n")
+	}
+
+	hidden := len(lines) - maxBodyLines
+	keep := max(0, maxBodyLines-1)
+	out := append([]string(nil), lines[:keep]...)
+	out = append(out, m.styles.Dim.Render(fmt.Sprintf("... (+%d more)", hidden)))
+	return strings.Join(out, "\n")
 }
 
 func (m model) regionsLabel() string {
@@ -903,7 +1023,7 @@ func (m model) detailsView() string {
 			val("E: audit events"),
 			val("[ ]: prev/next page"),
 			val("backspace: back"),
-			val("ctrl+r: refresh"),
+			val("ctrl+r: refresh current scope"),
 			val("p: pricing mode"),
 			val("T: cycle theme"),
 			val("q: quit"),

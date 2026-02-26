@@ -162,6 +162,7 @@ func (m model) loadResourcesCmd() tea.Cmd {
 	regions := m.selectedRegionSlice()
 	page := m.pager.Page
 	perPage := m.pager.PerPage
+	ecsScope, useECSDrill := m.ecsDrillScopeForQuery()
 	return func() tea.Msg {
 		if service == "" || typ == "" {
 			return resourcesLoadedMsg{summaries: nil, total: 0, err: nil}
@@ -169,11 +170,22 @@ func (m model) loadResourcesCmd() tea.Cmd {
 		if strings.TrimSpace(m.accountID) == "" {
 			return resourcesLoadedMsg{summaries: nil, total: 0, err: nil}
 		}
+		offset := page * perPage
+		if useECSDrill {
+			total, err := m.st.CountECSDrillResourceSummaries(m.ctx, m.accountID, typ, regions, filter, ecsScope)
+			if err != nil {
+				return resourcesLoadedMsg{err: err}
+			}
+			summaries, err := m.st.ListECSDrillResourceSummariesPaged(m.ctx, m.accountID, typ, regions, filter, ecsScope, perPage, offset)
+			if err != nil {
+				return resourcesLoadedMsg{err: err}
+			}
+			return resourcesLoadedMsg{summaries: summaries, total: total}
+		}
 		total, err := m.st.CountResourceSummariesByServiceTypeAndRegions(m.ctx, m.accountID, service, typ, regions, filter)
 		if err != nil {
 			return resourcesLoadedMsg{err: err}
 		}
-		offset := page * perPage
 		summaries, err := m.st.ListResourceSummariesByServiceTypeAndRegionsPaged(m.ctx, m.accountID, service, typ, regions, filter, perPage, offset)
 		if err != nil {
 			return resourcesLoadedMsg{err: err}

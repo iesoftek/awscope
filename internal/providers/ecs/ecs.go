@@ -342,22 +342,35 @@ func listAllTasks(ctx context.Context, api ecsAPI, clusterArn string) ([]string,
 		return nil, nil
 	}
 	var out []string
-	var nextToken *string
-	desired := types.DesiredStatusRunning
-	for {
-		resp, err := api.ListTasks(ctx, &sdkecs.ListTasksInput{
-			Cluster:       &clusterArn,
-			DesiredStatus: desired,
-			NextToken:     nextToken,
-		})
-		if err != nil {
-			return nil, err
+	seen := map[string]struct{}{}
+	statuses := []types.DesiredStatus{
+		types.DesiredStatusRunning,
+		types.DesiredStatusPending,
+		types.DesiredStatusStopped,
+	}
+	for _, desired := range statuses {
+		var nextToken *string
+		for {
+			resp, err := api.ListTasks(ctx, &sdkecs.ListTasksInput{
+				Cluster:       &clusterArn,
+				DesiredStatus: desired,
+				NextToken:     nextToken,
+			})
+			if err != nil {
+				return nil, err
+			}
+			for _, arn := range resp.TaskArns {
+				if _, ok := seen[arn]; ok {
+					continue
+				}
+				seen[arn] = struct{}{}
+				out = append(out, arn)
+			}
+			if resp.NextToken == nil || *resp.NextToken == "" {
+				break
+			}
+			nextToken = resp.NextToken
 		}
-		out = append(out, resp.TaskArns...)
-		if resp.NextToken == nil || *resp.NextToken == "" {
-			break
-		}
-		nextToken = resp.NextToken
 	}
 	return out, nil
 }
@@ -556,9 +569,15 @@ func normalizeTask(partition, accountID, region, clusterName string, t types.Tas
 		"lastStatus":    awsToString(t.LastStatus),
 		"desiredStatus": awsToString(t.DesiredStatus),
 		"launchType":    string(t.LaunchType),
+		"group":         awsToString(t.Group),
 		"taskDefinition": func() string {
 			return strings.TrimSpace(awsToString(t.TaskDefinitionArn))
 		}(),
+	}
+	if g := strings.TrimSpace(awsToString(t.Group)); strings.HasPrefix(g, "service:") {
+		if svc := strings.TrimSpace(strings.TrimPrefix(g, "service:")); svc != "" {
+			attrs["serviceName"] = svc
+		}
 	}
 	if td := strings.TrimSpace(awsToString(t.TaskDefinitionArn)); td != "" && tdInfo != nil {
 		if info, ok := tdInfo[td]; ok {

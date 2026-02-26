@@ -20,6 +20,52 @@ Go 1.25+:
 go run ./cmd/awscope --help
 ```
 
+Install from a GitHub release tarball (Linux/macOS):
+
+```sh
+VERSION="0.1.0"
+OS="$(uname | tr '[:upper:]' '[:lower:]')"
+ARCH="$(uname -m)"
+case "${ARCH}" in
+  x86_64) ARCH="amd64" ;;
+  arm64|aarch64) ARCH="arm64" ;;
+  *) echo "unsupported arch: ${ARCH}" && exit 1 ;;
+esac
+curl -fsSL -o awscope.tar.gz "https://github.com/iesoftek/awscope/releases/download/v${VERSION}/awscope_${VERSION}_${OS}_${ARCH}.tar.gz"
+tar -xzf awscope.tar.gz
+./awscope version
+```
+
+Install via Homebrew cask (macOS):
+
+```sh
+brew tap iesoftek/tap
+brew install --cask awscope
+```
+
+## Release Process
+
+- Releases are automated with GitHub Actions + Release Please.
+- `release-please` opens and updates a release PR on `main`, including `CHANGELOG.md`.
+- Merging the release PR creates the `vX.Y.Z` tag and publishes a GitHub release.
+- A release-published workflow builds and uploads cross-platform archives:
+  - `linux/amd64`
+  - `linux/arm64`
+  - `darwin/amd64`
+  - `darwin/arm64`
+- The same workflow updates the Homebrew cask in `iesoftek/homebrew-tap`.
+
+## PR Title Convention
+
+PR titles must follow Conventional Commits and pass the `PR Title` workflow check.
+
+Examples:
+
+- `feat: add cloudtrail timeline filtering`
+- `fix: handle empty region sets`
+- `refactor!: simplify scan pipeline state`
+- `docs: update release troubleshooting`
+
 ## Quickstart
 
 Initial full scan:
