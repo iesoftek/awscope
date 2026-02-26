@@ -19,6 +19,9 @@ type RunActionOptions struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
+	// AutoApproveTeardownOnCancel allows actions with teardown confirmations
+	// to skip prompt gating when the action context is canceled.
+	AutoApproveTeardownOnCancel bool
 }
 
 var loadActionIdentity = func(ctx context.Context, profileName, region string) (awsSDK.Config, aws.Identity, *aws.Loader, error) {
@@ -80,17 +83,18 @@ func RunAction(ctx context.Context, st *store.Store, actionID string, key graph.
 	})
 
 	execCtx := actions.ExecContext{
-		Store:       st,
-		Loader:      loader,
-		AWSConfig:   cfg,
-		Profile:     profileName,
-		AccountID:   id.AccountID,
-		Partition:   partition,
-		Region:      region,
-		ActionRunID: runID,
-		Stdin:       runOpts.Stdin,
-		Stdout:      runOpts.Stdout,
-		Stderr:      runOpts.Stderr,
+		Store:                       st,
+		Loader:                      loader,
+		AWSConfig:                   cfg,
+		Profile:                     profileName,
+		AccountID:                   id.AccountID,
+		Partition:                   partition,
+		Region:                      region,
+		ActionRunID:                 runID,
+		Stdin:                       runOpts.Stdin,
+		Stdout:                      runOpts.Stdout,
+		Stderr:                      runOpts.Stderr,
+		AutoApproveTeardownOnCancel: runOpts.AutoApproveTeardownOnCancel,
 	}
 
 	var res actions.Result

@@ -474,7 +474,7 @@ func (m model) actionItemsForSelection() []list.Item {
 	return items
 }
 
-func (m model) tryRunActionCmd() tea.Cmd {
+func (m *model) tryRunActionCmd() tea.Cmd {
 	sel, ok := m.activeSelection()
 	if !ok {
 		m.statusLine = "no selection"
@@ -503,6 +503,16 @@ func (m model) tryRunActionCmd() tea.Cmd {
 	m.statusLine = ""
 
 	if a, ok := actionsRegistry.Get(actionID); ok {
+		if ea, ok := a.(actions.EmbeddedTUIAction); ok && ea.PreferEmbeddedTUI() {
+			target := strings.TrimSpace(sel.DisplayName)
+			if target == "" {
+				target = strings.TrimSpace(sel.PrimaryID)
+			}
+			if target == "" {
+				target = string(key)
+			}
+			return m.startActionStreamCmd(actionID, key, profile, target)
+		}
 		if _, isTerminal := a.(actions.TerminalAction); isTerminal {
 			execCmd := &tuiActionExecCommand{
 				ctx:      m.ctx,

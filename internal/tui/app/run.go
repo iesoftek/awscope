@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"awscope/internal/aws"
+	"awscope/internal/catalog"
 	"awscope/internal/providers/registry"
 	"awscope/internal/store"
 	"awscope/internal/tui/components/graphlens"
@@ -46,6 +47,7 @@ func Run(ctx context.Context, st *store.Store, opts Options) error {
 		selected = serviceIDs[0]
 	}
 	selectedType := defaultTypeForService(selected)
+	initialPreset := catalog.ResourceTablePreset(selected, selectedType)
 
 	nav := navigator.New(serviceIDs, fallbackTypesForService)
 	nav.SetSelection(selected, selectedType)
@@ -53,7 +55,7 @@ func Run(ctx context.Context, st *store.Store, opts Options) error {
 		nav.ToggleExpandedService(selected)
 	}
 
-	resTable := table.New(table.WithColumns(buildResourceColumns(80, false, false, false)), table.WithRows(nil))
+	resTable := table.New(table.WithColumns(buildResourceColumns(80, initialPreset, false)), table.WithRows(nil))
 	resTable.SetStyles(table.DefaultStyles())
 
 	lens := graphlens.New()
@@ -93,6 +95,12 @@ func Run(ctx context.Context, st *store.Store, opts Options) error {
 	auditFacetList.SetShowStatusBar(false)
 	auditFacetList.SetFilteringEnabled(false)
 	auditFacetList.Title = ""
+
+	actionStreamViewport := viewport.New(80, 18)
+	actionStreamInput := textinput.New()
+	actionStreamInput.Placeholder = "type response and press enter (y/N)"
+	actionStreamInput.CharLimit = 256
+	actionStreamInput.Width = 48
 
 	actionsList := list.New([]list.Item{}, list.NewDefaultDelegate(), 30, 10)
 	actionsList.SetShowHelp(false)
@@ -141,6 +149,12 @@ func Run(ctx context.Context, st *store.Store, opts Options) error {
 		auditFacetEventNamePicker: auditFacetList,
 		auditPageCache:            map[string]store.CloudTrailCursorPage{},
 		auditDetailViewport:       viewport.New(30, 10),
+		actionStreamViewport:      actionStreamViewport,
+		actionStreamInput:         actionStreamInput,
+		actionStreamFollowTail:    true,
+		actionStreamWrap:          true,
+		actionStreamColorize:      true,
+		actionStreamMaxBytes:      defaultActionStreamMaxBytes,
 		related:                   relatedList,
 		raw:                       viewport.New(30, 10),
 		actions:                   actionsList,

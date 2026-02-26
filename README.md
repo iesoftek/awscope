@@ -245,6 +245,18 @@ Run SSH via EC2 Instance Connect from CLI:
 go run ./cmd/awscope action run --id ec2.ssh --key <resource_key> --profile default --confirm
 ```
 
+Run SQS mirror stream action from CLI (never reads the primary queue directly):
+
+```sh
+go run ./cmd/awscope action run --id sqs.mirror-stream --key <resource_key> --profile default --confirm
+```
+
+Run SNS stream action from CLI (live capture only via ephemeral SQS subscriber):
+
+```sh
+go run ./cmd/awscope action run --id sns.stream --key <resource_key> --profile default --confirm
+```
+
 Run SSM shell action from TUI:
 
 - select a running EC2 instance
@@ -254,6 +266,22 @@ Run SSM shell action from TUI:
 
 When the interactive session exits, awscope regains terminal control automatically.
 
+SQS mirror stream behavior:
+
+- Target resource must be an `sqs:queue` subscribed to at least one SNS topic.
+- awscope discovers SNS->SQS fanout, creates/updates a mirror queue path, streams from that mirror queue, and prompts at each mutating step.
+- Stream reads mirrored messages and deletes them from the mirror queue after printing.
+- Primary queue is never read by this action.
+- On exit, awscope prompts to unsubscribe session-created subscriptions and delete the session-created mirror queue.
+
+SNS stream behavior:
+
+- Target resource must be an `sns:topic`.
+- awscope creates or reuses an ephemeral SQS stream queue, patches queue policy for the topic, subscribes if needed, then streams from that queue.
+- This is live capture only; SNS does not provide historical replay.
+- Stream consumes/deletes messages from the ephemeral stream queue, not from your existing consumers.
+- On exit, awscope prompts to unsubscribe session-created subscriptions and delete the session-created stream queue.
+
 Prerequisites for terminal EC2 actions:
 
 - AWS CLI v2 installed and available in `PATH`
@@ -261,6 +289,8 @@ Prerequisites for terminal EC2 actions:
 - `ec2.ssh`: OpenSSH client available in `PATH` and a public key at `~/.ssh/id_rsa.pub` (or `~/.ssh/id_ed25519.pub`)
 - IAM permissions to start SSM sessions (for example `ssm:StartSession` and related session channel permissions)
 - IAM permissions for EC2 Instance Connect (`ec2-instance-connect:SendSSHPublicKey`) and EC2 Instance Connect Endpoint/open-tunnel access as applicable
+- `sns.stream`: `sns:GetTopicAttributes`, `sns:ListSubscriptionsByTopic`, `sns:Subscribe`, `sns:Unsubscribe`, `sqs:GetQueueUrl`, `sqs:GetQueueAttributes`, `sqs:CreateQueue`, `sqs:SetQueueAttributes`, `sqs:ReceiveMessage`, `sqs:DeleteMessageBatch`, `sqs:DeleteQueue`
+- `sqs.mirror-stream`: `sqs:GetQueueAttributes`, `sqs:GetQueueUrl`, `sqs:CreateQueue`, `sqs:SetQueueAttributes`, `sqs:DeleteQueue`, `sqs:ReceiveMessage`, `sqs:DeleteMessageBatch`, `sns:ListSubscriptions`, `sns:ListSubscriptionsByTopic`, `sns:Subscribe`, `sns:Unsubscribe`
 
 Tip:
 

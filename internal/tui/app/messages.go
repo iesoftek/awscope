@@ -113,6 +113,22 @@ type actionDoneMsg struct {
 	err  error
 }
 
+type actionStreamChunkMsg struct {
+	seq    int
+	chunk  string
+	stderr bool
+}
+
+type actionStreamDoneMsg struct {
+	seq  int
+	line string
+	err  error
+}
+
+type actionStreamClosedMsg struct {
+	seq int
+}
+
 type filterDebouncedMsg struct {
 	seq   int
 	value string

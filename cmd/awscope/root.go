@@ -5,6 +5,8 @@ import (
 
 	_ "awscope/internal/actions/ec2"
 	_ "awscope/internal/actions/ecs"
+	_ "awscope/internal/actions/sns"
+	_ "awscope/internal/actions/sqs"
 
 	_ "awscope/internal/providers/accessanalyzer"
 	_ "awscope/internal/providers/acm"

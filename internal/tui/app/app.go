@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"strings"
 	"time"
 
 	"awscope/internal/aws"
+	"awscope/internal/catalog"
 	"awscope/internal/graph"
 	"awscope/internal/store"
 	"awscope/internal/tui/components/graphlens"
@@ -41,6 +43,8 @@ const (
 	focusAudit
 	focusAuditFilter
 	focusAuditFacets
+	focusActionStream
+	focusActionStreamInput
 )
 
 type detailsTab int
@@ -168,6 +172,28 @@ type model struct {
 	auditPageCache      map[string]store.CloudTrailCursorPage
 	auditPageCacheOrder []string
 
+	actionStreamOpen        bool
+	actionStreamActionID    string
+	actionStreamTarget      string
+	actionStreamRunning     bool
+	actionStreamStopping    bool
+	actionStreamCloseOnStop bool
+	actionStreamFollowTail  bool
+	actionStreamWrap        bool
+	actionStreamColorize    bool
+	actionStreamErr         error
+	actionStreamDoneLine    string
+	actionStreamViewport    viewport.Model
+	actionStreamInput       textinput.Model
+	actionStreamSeq         int
+	actionStreamCh          <-chan tea.Msg
+	actionStreamCancel      context.CancelFunc
+	actionStreamInputWriter io.WriteCloser
+	actionStreamLog         string
+	actionStreamWrappedLog  string
+	actionStreamRenderWidth int
+	actionStreamMaxBytes    int
+
 	graphMode    bool
 	graphRootKey graph.ResourceKey
 
@@ -280,14 +306,11 @@ func (m *model) applyTheme() {
 	m.regionTable.SetStyles(tbl)
 	m.auditTable.SetStyles(tbl)
 	// Re-render row content that embeds style (e.g. dim "-").
-	includeStored := strings.EqualFold(m.selectedService, "logs") && strings.EqualFold(m.selectedType, "logs:log-group")
-	includeIAMKeyFields := strings.EqualFold(m.selectedService, "iam") && strings.EqualFold(m.selectedType, "iam:access-key")
 	w := 80
 	if m.paneMidW > 0 {
 		w = m.paneMidW - 4
 	}
-	m.resources.SetColumns(buildResourceColumns(w, m.pricingMode, includeStored, includeIAMKeyFields))
-	m.resources.SetRows(makeResourceRows(m.resourceSummaries, m.pricingMode, m.styles, m.icons, includeStored, includeIAMKeyFields))
+	m.applyResourceTableLayout(w, m.resourceSummaries)
 	auditW := 80
 	if m.width > 0 {
 		auditW = max(20, m.width-4)
@@ -325,6 +348,15 @@ func (m *model) applyTheme() {
 	}
 }
 
+func (m *model) applyResourceTableLayout(width int, summaries []store.ResourceSummary) {
+	if width <= 0 {
+		width = 80
+	}
+	preset := catalog.ResourceTablePreset(m.selectedService, m.selectedType)
+	m.resources.SetColumns(buildResourceColumns(width, preset, m.pricingMode))
+	m.resources.SetRows(makeResourceRows(summaries, preset, m.pricingMode, m.styles, m.icons))
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
@@ -339,6 +371,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 			return m, nil
+		}
+		if m.actionStreamOpen {
+			if cmd, handled := m.handleActionStreamKey(msg); handled {
+				return m, cmd
+			}
 		}
 		if m.auditOpen && m.focus != focusRegions {
 			if cmd, handled := m.handleAuditKey(msg); handled {
@@ -382,18 +419,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.paneMidW > 0 {
 					w = m.paneMidW - 4
 				}
-				includeStored := strings.EqualFold(m.selectedService, "logs") && strings.EqualFold(m.selectedType, "logs:log-group")
-				includeIAMKeyFields := strings.EqualFold(m.selectedService, "iam") && strings.EqualFold(m.selectedType, "iam:access-key")
-				// Avoid transient row/column mismatches that can panic in table rendering.
-				if newMode {
-					// Adding a column: columns first, then rows.
-					m.resources.SetColumns(buildResourceColumns(w, true, includeStored, includeIAMKeyFields))
-					m.resources.SetRows(makeResourceRows(m.resourceSummaries, true, m.styles, m.icons, includeStored, includeIAMKeyFields))
-				} else {
-					// Removing a column: rows first, then columns.
-					m.resources.SetRows(makeResourceRows(m.resourceSummaries, false, m.styles, m.icons, includeStored, includeIAMKeyFields))
-					m.resources.SetColumns(buildResourceColumns(w, false, includeStored, includeIAMKeyFields))
-				}
+				m.applyResourceTableLayout(w, m.resourceSummaries)
 
 				// Load cost aggregates when enabled.
 				if newMode {
@@ -1058,14 +1084,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.resourceSummaries = msg.summaries
-			includeStored := strings.EqualFold(m.selectedService, "logs") && strings.EqualFold(m.selectedType, "logs:log-group")
-			includeIAMKeyFields := strings.EqualFold(m.selectedService, "iam") && strings.EqualFold(m.selectedType, "iam:access-key")
 			w := 80
 			if m.paneMidW > 0 {
 				w = m.paneMidW - 4
 			}
-			m.resources.SetColumns(buildResourceColumns(w, m.pricingMode, includeStored, includeIAMKeyFields))
-			m.resources.SetRows(makeResourceRows(msg.summaries, m.pricingMode, m.styles, m.icons, includeStored, includeIAMKeyFields))
+			m.applyResourceTableLayout(w, msg.summaries)
 			if m.pendingSelectKey != "" {
 				for idx := range msg.summaries {
 					if msg.summaries[idx].Key == m.pendingSelectKey {
@@ -1229,6 +1252,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.confirm.Blur()
 		m.focus = focusResources
 
+	case actionStreamChunkMsg, actionStreamDoneMsg, actionStreamClosedMsg:
+		if cmd := m.handleActionStreamMessage(msg); cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -1251,14 +1279,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.help.Width = w
 		m.statusbar, _ = m.statusbar.Update(msg)
 
-		includeStored := strings.EqualFold(m.selectedService, "logs") && strings.EqualFold(m.selectedType, "logs:log-group")
-		includeIAMKeyFields := strings.EqualFold(m.selectedService, "iam") && strings.EqualFold(m.selectedType, "iam:access-key")
-		m.resources.SetColumns(buildResourceColumns(mid-4, m.pricingMode, includeStored, includeIAMKeyFields))
+		m.applyResourceTableLayout(mid-4, m.resourceSummaries)
 		m.regionTable.SetWidth(mid - 4)
 		m.regionTable.SetHeight(max(6, h-12))
 		m.regionTable.SetColumns(buildRegionColumns(mid - 4))
 		m.regionFilter.Width = min(30, max(10, mid-16))
 		m.resizeAuditWidgets()
+		m.resizeActionStreamWidgets()
 		// Graph Lens side lists are sized dynamically in View(), but we still update height here.
 		lensH := max(4, h-11)
 		sideW := max(12, (mid-10)/3)
@@ -1290,6 +1317,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.auditTable.Focus()
 	} else {
 		m.auditTable.Blur()
+	}
+	if m.focus == focusActionStreamInput {
+		m.actionStreamInput.Focus()
+	} else {
+		m.actionStreamInput.Blur()
 	}
 
 	// Delegate updates based on focus.
@@ -1435,6 +1467,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return auditFilterDebouncedMsg{seq: seq, value: val}
 			}))
 		}
+	case focusActionStream:
+		var cmd tea.Cmd
+		m.actionStreamViewport, cmd = m.actionStreamViewport.Update(msg)
+		cmds = append(cmds, cmd)
+	case focusActionStreamInput:
+		var cmd tea.Cmd
+		m.actionStreamInput, cmd = m.actionStreamInput.Update(msg)
+		cmds = append(cmds, cmd)
 	}
 
 	// Refresh neighbors on selection movement in the resource table.

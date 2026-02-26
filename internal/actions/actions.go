@@ -31,6 +31,10 @@ type ExecContext struct {
 	Stdin       io.Reader
 	Stdout      io.Writer
 	Stderr      io.Writer
+	// AutoApproveTeardownOnCancel allows actions with teardown prompts to
+	// proceed without interactive confirmation when the action context is
+	// canceled (for example, Esc in embedded TUI streaming mode).
+	AutoApproveTeardownOnCancel bool
 }
 
 type Result struct {
@@ -53,4 +57,11 @@ type Action interface {
 type TerminalAction interface {
 	Action
 	ExecuteTerminal(ctx context.Context, exec ExecContext, node graph.ResourceNode) (Result, error)
+}
+
+// EmbeddedTUIAction is an optional capability for terminal actions that can be
+// executed inside the awscope TUI using stdin/stdout streaming.
+type EmbeddedTUIAction interface {
+	TerminalAction
+	PreferEmbeddedTUI() bool
 }

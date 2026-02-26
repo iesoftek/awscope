@@ -19,13 +19,14 @@ import (
 )
 
 type testTerminalAction struct {
-	id         string
-	called     bool
-	gotStdin   bool
-	gotStdout  bool
-	gotStderr  bool
-	fail       error
-	execCalled bool
+	id             string
+	called         bool
+	gotStdin       bool
+	gotStdout      bool
+	gotStderr      bool
+	gotAutoApprove bool
+	fail           error
+	execCalled     bool
 }
 
 func (a *testTerminalAction) ID() string          { return a.id }
@@ -46,6 +47,7 @@ func (a *testTerminalAction) ExecuteTerminal(ctx context.Context, exec actions.E
 	a.gotStdin = exec.Stdin != nil
 	a.gotStdout = exec.Stdout != nil
 	a.gotStderr = exec.Stderr != nil
+	a.gotAutoApprove = exec.AutoApproveTeardownOnCancel
 	if a.fail != nil {
 		return actions.Result{}, a.fail
 	}
@@ -105,9 +107,10 @@ func TestRunAction_UsesTerminalActionAndPassesStdio(t *testing.T) {
 	stdout := &bytes.Buffer{}
 	stderr := &bytes.Buffer{}
 	res, err := RunAction(ctx, st, id, key, "default", RunActionOptions{
-		Stdin:  stdin,
-		Stdout: stdout,
-		Stderr: stderr,
+		Stdin:                       stdin,
+		Stdout:                      stdout,
+		Stderr:                      stderr,
+		AutoApproveTeardownOnCancel: true,
 	})
 	if err != nil {
 		t.Fatalf("RunAction: %v", err)
@@ -123,6 +126,9 @@ func TestRunAction_UsesTerminalActionAndPassesStdio(t *testing.T) {
 	}
 	if !a.gotStdin || !a.gotStdout || !a.gotStderr {
 		t.Fatalf("expected stdio to be passed (stdin=%v stdout=%v stderr=%v)", a.gotStdin, a.gotStdout, a.gotStderr)
+	}
+	if !a.gotAutoApprove {
+		t.Fatalf("expected AutoApproveTeardownOnCancel to be passed")
 	}
 
 	status, err := st.GetActionRunStatus(ctx, res.ActionRunID)

@@ -14,6 +14,9 @@ import (
 )
 
 func (m model) View() string {
+	if m.actionStreamOpen {
+		return m.actionStreamFullScreenView()
+	}
 	if m.auditOpen {
 		return m.auditFullScreenView()
 	}
@@ -531,6 +534,10 @@ func focusName(f focus) string {
 		return "audit-filter"
 	case focusAuditFacets:
 		return "audit-facets"
+	case focusActionStream:
+		return "action-stream"
+	case focusActionStreamInput:
+		return "action-stream-input"
 	default:
 		return "unknown"
 	}
@@ -574,7 +581,9 @@ func (m model) topBar(headerStyle lipgloss.Style, metaOuterW int) string {
 		}
 	}
 	mode := "LIST"
-	if m.auditOpen {
+	if m.actionStreamOpen {
+		mode = "ACTION"
+	} else if m.auditOpen {
 		mode = "AUDIT"
 	} else if m.graphMode {
 		mode = "GRAPH"
