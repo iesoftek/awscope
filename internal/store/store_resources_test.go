@@ -520,6 +520,141 @@ func TestStore_ListResourceSummariesByServiceTypeAndRegionsPaged_IAMKeysOrderedB
 	}
 }
 
+func TestStore_ECSDrill_ServicesUnderCluster(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test.sqlite")
+	st, err := Open(OpenOptions{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC()
+	clusterA := graph.EncodeResourceKey("aws", "111111111111", "us-west-2", "ecs:cluster", "arn:aws:ecs:us-west-2:111111111111:cluster/a")
+	clusterB := graph.EncodeResourceKey("aws", "111111111111", "us-west-2", "ecs:cluster", "arn:aws:ecs:us-west-2:111111111111:cluster/b")
+	svcA := graph.EncodeResourceKey("aws", "111111111111", "us-west-2", "ecs:service", "arn:aws:ecs:us-west-2:111111111111:service/a/orders")
+	svcB := graph.EncodeResourceKey("aws", "111111111111", "us-west-2", "ecs:service", "arn:aws:ecs:us-west-2:111111111111:service/b/payments")
+
+	if err := st.UpsertResources(ctx, []graph.ResourceNode{
+		{Key: clusterA, DisplayName: "a", Service: "ecs", Type: "ecs:cluster", PrimaryID: string(clusterA), CollectedAt: now, Source: "test"},
+		{Key: clusterB, DisplayName: "b", Service: "ecs", Type: "ecs:cluster", PrimaryID: string(clusterB), CollectedAt: now, Source: "test"},
+		{Key: svcA, DisplayName: "orders", Service: "ecs", Type: "ecs:service", PrimaryID: string(svcA), Attributes: map[string]any{"runningCount": 3}, CollectedAt: now, Source: "test"},
+		{Key: svcB, DisplayName: "payments", Service: "ecs", Type: "ecs:service", PrimaryID: string(svcB), Attributes: map[string]any{"runningCount": 1}, CollectedAt: now, Source: "test"},
+	}); err != nil {
+		t.Fatalf("UpsertResources: %v", err)
+	}
+	if err := st.UpsertEdges(ctx, []graph.RelationshipEdge{
+		{From: svcA, To: clusterA, Kind: "member-of", CollectedAt: now},
+		{From: svcB, To: clusterB, Kind: "member-of", CollectedAt: now},
+	}); err != nil {
+		t.Fatalf("UpsertEdges: %v", err)
+	}
+
+	scope := ECSDrillScope{Level: "services", ClusterKey: clusterA, Region: "us-west-2"}
+	total, err := st.CountECSDrillResourceSummaries(ctx, "111111111111", "ecs:service", []string{"us-west-2"}, "", scope)
+	if err != nil {
+		t.Fatalf("CountECSDrillResourceSummaries: %v", err)
+	}
+	if total != 1 {
+		t.Fatalf("total: got %d want 1", total)
+	}
+	ss, err := st.ListECSDrillResourceSummariesPaged(ctx, "111111111111", "ecs:service", []string{"us-west-2"}, "", scope, 20, 0)
+	if err != nil {
+		t.Fatalf("ListECSDrillResourceSummariesPaged: %v", err)
+	}
+	if len(ss) != 1 || ss[0].DisplayName != "orders" {
+		t.Fatalf("summaries: %#v", ss)
+	}
+}
+
+func TestStore_ECSDrill_TasksByService_EdgeAndFallback(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "test.sqlite")
+	st, err := Open(OpenOptions{Path: dbPath})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	now := time.Now().UTC()
+	clusterArn := "arn:aws:ecs:us-west-2:111111111111:cluster/a"
+	clusterKey := graph.EncodeResourceKey("aws", "111111111111", "us-west-2", "ecs:cluster", clusterArn)
+	serviceArn := "arn:aws:ecs:us-west-2:111111111111:service/a/orders"
+	serviceKey := graph.EncodeResourceKey("aws", "111111111111", "us-west-2", "ecs:service", serviceArn)
+	taskEdge := graph.EncodeResourceKey("aws", "111111111111", "us-west-2", "ecs:task", "arn:aws:ecs:us-west-2:111111111111:task/a/edge")
+	taskFallback := graph.EncodeResourceKey("aws", "111111111111", "us-west-2", "ecs:task", "arn:aws:ecs:us-west-2:111111111111:task/a/fallback")
+	taskOther := graph.EncodeResourceKey("aws", "111111111111", "us-west-2", "ecs:task", "arn:aws:ecs:us-west-2:111111111111:task/a/other")
+
+	if err := st.UpsertResources(ctx, []graph.ResourceNode{
+		{Key: clusterKey, DisplayName: "a", Service: "ecs", Type: "ecs:cluster", Arn: clusterArn, PrimaryID: clusterArn, CollectedAt: now, Source: "test"},
+		{Key: serviceKey, DisplayName: "orders", Service: "ecs", Type: "ecs:service", Arn: serviceArn, PrimaryID: serviceArn, CollectedAt: now, Source: "test"},
+		{
+			Key:         taskEdge,
+			DisplayName: "edge",
+			Service:     "ecs",
+			Type:        "ecs:task",
+			PrimaryID:   string(taskEdge),
+			Attributes:  map[string]any{"created_at": "2026-02-25 10:00", "serviceName": "orders", "clusterArn": clusterArn},
+			CollectedAt: now,
+			Source:      "test",
+		},
+		{
+			Key:         taskFallback,
+			DisplayName: "fallback",
+			Service:     "ecs",
+			Type:        "ecs:task",
+			PrimaryID:   string(taskFallback),
+			Attributes:  map[string]any{"created_at": "2026-02-25 09:00", "serviceName": "orders", "clusterArn": clusterArn},
+			CollectedAt: now,
+			Source:      "test",
+		},
+		{
+			Key:         taskOther,
+			DisplayName: "other",
+			Service:     "ecs",
+			Type:        "ecs:task",
+			PrimaryID:   string(taskOther),
+			Attributes:  map[string]any{"created_at": "2026-02-25 11:00", "serviceName": "payments", "clusterArn": clusterArn},
+			CollectedAt: now,
+			Source:      "test",
+		},
+	}); err != nil {
+		t.Fatalf("UpsertResources: %v", err)
+	}
+	if err := st.UpsertEdges(ctx, []graph.RelationshipEdge{
+		{From: serviceKey, To: clusterKey, Kind: "member-of", CollectedAt: now},
+		{From: taskEdge, To: serviceKey, Kind: "belongs-to", CollectedAt: now},
+	}); err != nil {
+		t.Fatalf("UpsertEdges: %v", err)
+	}
+
+	scope := ECSDrillScope{
+		Level:       "tasks",
+		ClusterKey:  clusterKey,
+		ClusterArn:  clusterArn,
+		ServiceKey:  serviceKey,
+		ServiceName: "orders",
+		Region:      "us-west-2",
+	}
+	total, err := st.CountECSDrillResourceSummaries(ctx, "111111111111", "ecs:task", []string{"us-west-2"}, "", scope)
+	if err != nil {
+		t.Fatalf("CountECSDrillResourceSummaries: %v", err)
+	}
+	if total != 2 {
+		t.Fatalf("total: got %d want 2", total)
+	}
+	ss, err := st.ListECSDrillResourceSummariesPaged(ctx, "111111111111", "ecs:task", []string{"us-west-2"}, "", scope, 20, 0)
+	if err != nil {
+		t.Fatalf("ListECSDrillResourceSummariesPaged: %v", err)
+	}
+	if len(ss) != 2 {
+		t.Fatalf("len: got %d want 2", len(ss))
+	}
+	if ss[0].DisplayName != "edge" || ss[1].DisplayName != "fallback" {
+		t.Fatalf("order/results: %#v", ss)
+	}
+}
+
 func TestStore_DiagramQueries_RegionAndLinkedGlobal(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "test.sqlite")

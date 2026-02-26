@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"awscope/internal/actions"
+	"awscope/internal/core"
 	"awscope/internal/graph"
 	"awscope/internal/store"
 )
@@ -126,6 +127,21 @@ type actionStreamDoneMsg struct {
 }
 
 type actionStreamClosedMsg struct {
+	seq int
+}
+
+type refreshProgressMsg struct {
+	seq int
+	ev  core.ScanProgressEvent
+}
+
+type refreshDoneMsg struct {
+	seq int
+	res core.ScanResult
+	err error
+}
+
+type refreshClosedMsg struct {
 	seq int
 }
 

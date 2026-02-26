@@ -86,6 +86,7 @@ func (m *model) setContextFromKey(key graph.ResourceKey) {
 	if resourceType != "" {
 		m.selectedType = resourceType
 	}
+	m.applyECSSelection(m.selectedService, m.selectedType, false)
 	if region != "" {
 		m.selectedRegions = map[string]bool{region: true}
 		m.applyServiceScope()
@@ -130,6 +131,7 @@ func (m *model) pushNav() {
 		lensInCursor:    inCur,
 		lensOutCursor:   outCur,
 		lensExpanded:    m.lens.ExpandedKeys(),
+		ecsDrill:        m.ecsDrill,
 	})
 }
 
@@ -162,6 +164,7 @@ func (m *model) restoreNav() {
 	}
 	m.lens.SetExpanded(last.lensExpanded)
 	m.lens.SetCursors(last.lensInCursor, last.lensOutCursor)
+	m.ecsDrill = last.ecsDrill
 	m.focus = focusResources
 	m.pendingSelectKey = last.selectedKey
 }
@@ -196,6 +199,7 @@ func (m *model) jumpTo(service, region string, key graph.ResourceKey) {
 	} else if m.selectedType == "" {
 		m.selectedType = defaultTypeForService(service)
 	}
+	m.applyECSSelection(m.selectedService, m.selectedType, false)
 	m.selectedRegions = map[string]bool{region: true}
 	m.applyServiceScope()
 
