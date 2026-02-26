@@ -3,7 +3,7 @@
 AWS inventory scanner + interactive TUI for browsing resources and relationships.
 
 
-<img width="1024" height="506" alt="image" src="https://github.com/user-attachments/assets/5f93bb55-9956-438f-b339-aef632cc7765" />
+<img width="2125" height="1195" alt="image" src="https://github.com/user-attachments/assets/44133479-62e6-4637-ba83-a391d9a6f51e" />
 
 
 
